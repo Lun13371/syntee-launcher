@@ -1,0 +1,20 @@
+# Binaries
+*.exe
+*.exe~
+syntee-launcher
+syntee-launcher.exe
+
+# Test artifacts
+/staging/
+/backups/
+/current/
+/launcher.json
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini

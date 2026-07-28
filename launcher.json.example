@@ -1,0 +1,13 @@
+{
+  "update_server": "https://gateway.syntee.dev/api/public/updates",
+  "channel": "stable",
+  "current_version": "0.1.0",
+  "pinned_version": null,
+  "bad_versions": [],
+  "crash_count": 0,
+  "max_crash_retries": 3,
+  "check_timeout_sec": 5,
+  "download_timeout_sec": 0,
+  "client_exe": "SynteeHelper.exe",
+  "ready_marker": ".ready"
+}
