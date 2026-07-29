@@ -21,3 +21,6 @@ desktop.ini
 
 # Logs
 *.log
+
+# Icon source (large binary, .syso is the compiled embed)
+icon.ico

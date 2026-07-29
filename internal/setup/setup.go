@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"syscall"
 
 	"github.com/Lun13371/syntee-launcher/internal/config"
 	"github.com/Lun13371/syntee-launcher/internal/updater"
@@ -43,7 +44,9 @@ func RunIfNeeded(ctx context.Context, cfg *config.Config, client *updater.Client
 func RunIfNeededWithOptions(ctx context.Context, cfg *config.Config, client *updater.Client,
 	opts InstallOptions, onProgress func(done, total int64), onPhase func(phase string)) error {
 	needsClient := !clientInstalled(cfg)
-	needsSetup := !setupDone(cfg)
+	// If we're downloading a fresh client, always (re)create shortcuts
+	// — even if old registry keys exist from a previous install.
+	needsSetup := !setupDone(cfg) || needsClient
 
 	if !needsClient && !needsSetup {
 		return nil
@@ -91,6 +94,8 @@ func RunIfNeededWithOptions(ctx context.Context, cfg *config.Config, client *upd
 		if onPhase != nil {
 			onPhase("register")
 		}
+		// Remove old shortcuts that might point to the launcher.
+		removeOldShortcuts()
 		if err := registerApp(cfg, opts); err != nil {
 			log.Printf("setup warning: %v", err)
 		}
@@ -151,6 +156,37 @@ func setupDone(cfg *config.Config) bool {
 func markSetupDone(cfg *config.Config) {
 	marker := filepath.Join(cfg.Dir(), ".setup_done")
 	_ = os.WriteFile(marker, []byte("ok"), 0o644)
+}
+
+// EnsureShortcuts always recreates desktop and start menu shortcuts
+// pointing at the client exe. Called on every launcher start when the
+// client is already installed. This guarantees shortcuts are correct
+// even after upgrading from an older launcher that pointed them at
+// the launcher binary.
+func EnsureShortcuts(cfg *config.Config) error {
+	log.Printf("ensuring shortcuts point to client exe")
+	removeOldShortcuts()
+	return registerApp(cfg, InstallOptions{
+		DesktopShortcut:   true,
+		StartMenuShortcut: true,
+		Autostart:         true,
+	})
+}
+
+// removeOldShortcuts deletes existing shortcuts so they can be recreated
+// pointing at the client exe (not the launcher). This handles the case
+// where a previous install created shortcuts pointing to the launcher.
+func removeOldShortcuts() {
+	startMenu := filepath.Join(os.Getenv("APPDATA"), "Microsoft", "Windows", "Start Menu", "Programs", "Syntee Helper.lnk")
+	desktop := filepath.Join(os.Getenv("USERPROFILE"), "Desktop", "Syntee Helper.lnk")
+	_ = os.Remove(startMenu)
+	_ = os.Remove(desktop)
+	// Remove old autostart entry (might point to launcher).
+	k, err := registry.OpenKey(registry.CURRENT_USER, autostartRegPath, registry.SET_VALUE)
+	if err == nil {
+		_ = k.DeleteValue("SynteeHelper")
+		k.Close()
+	}
 }
 
 // RecreateShortcuts deletes and recreates all shortcuts and autostart,
@@ -237,6 +273,10 @@ func createShortcut(lnkPath, targetPath, iconPath string) error {
 		lnkPath, targetPath, iconPath, filepath.Dir(targetPath),
 	)
 	cmd := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", script)
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		HideWindow:    true,
+		CreationFlags: 0x08000000, // CREATE_NO_WINDOW
+	}
 	return cmd.Run()
 }
 

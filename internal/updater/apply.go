@@ -4,8 +4,10 @@ import (
 	"archive/zip"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 )
@@ -62,7 +64,59 @@ func Apply(zipPath, currentDir, backupsDir, stagingDir, oldVersion string, onPro
 
 	// Clean the staging zip; keep staging/new already gone via the rename.
 	_ = os.Remove(zipPath)
+
+	// Prune old backups — keep only the 2 most recent.
+	// Each backup is ~400 MB, so without pruning this dir grows unbounded.
+	pruneBackups(backupsDir, 2)
+
 	return nil
+}
+
+// pruneBackups removes all but the keepCount most recent backup directories.
+// Backups are named "<version>_<unix_ts>". Directories starting with "bad_"
+// are also cleaned up (they're crash-loop forensics, not useful long-term).
+func pruneBackups(backupsDir string, keepCount int) {
+	entries, err := os.ReadDir(backupsDir)
+	if err != nil {
+		return
+	}
+	type backup struct {
+		name string
+		path string
+		ts   int64
+	}
+	var backups []backup
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		// Remove "bad_" forensics dirs older than 1 day.
+		if strings.HasPrefix(name, "bad_") {
+			info, err := e.Info()
+			if err == nil && time.Since(info.ModTime()) > 24*time.Hour {
+				_ = os.RemoveAll(filepath.Join(backupsDir, name))
+			}
+			continue
+		}
+		idx := strings.LastIndex(name, "_")
+		if idx <= 0 {
+			continue
+		}
+		var ts int64
+		fmt.Sscanf(name[idx+1:], "%d", &ts)
+		backups = append(backups, backup{name: name, path: filepath.Join(backupsDir, name), ts: ts})
+	}
+	if len(backups) <= keepCount {
+		return
+	}
+	// Sort by timestamp descending (newest first).
+	sort.Slice(backups, func(i, j int) bool { return backups[i].ts > backups[j].ts })
+	// Remove everything after the first keepCount.
+	for i := keepCount; i < len(backups); i++ {
+		log.Printf("prune: removing old backup %s", backups[i].name)
+		_ = os.RemoveAll(backups[i].path)
+	}
 }
 
 // unzip extracts every entry of a zip archive into dst. It rejects absolute

@@ -162,6 +162,12 @@ func runLifecycle(ctx context.Context, cfg *config.Config, client *updater.Clien
 	}
 
 	// ── 2. Already installed: check for updates ─────────────────────────
+	// Ensure shortcuts exist (they might be missing if a previous install
+	// was done before the shortcut fix, or if the user deleted them).
+	if err := setup.EnsureShortcuts(cfg); err != nil {
+		log.Printf("ensure shortcuts: %v", err)
+	}
+
 	g.SetState(gui.StateChecking, nil)
 
 	// Crash-loop recovery: if current version is marked bad, restore backup.
@@ -373,6 +379,25 @@ func launchClientAndCountdown(cfg *config.Config, g *gui.GUI) {
 	g.Terminate()
 }
 
+// killClientIfRunning kills any running instance of the client so the updater
+// can rename/replace files in current/. Uses taskkill /F with CREATE_NO_WINDOW
+// so no console pops up. If the client isn't running, taskkill exits non-zero
+// — we ignore the error. After killing, waits 2s for the OS to release handles.
+func killClientIfRunning(cfg *config.Config) {
+	exeName := cfg.ClientExe
+	cmd := exec.Command("taskkill", "/IM", exeName, "/F")
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		HideWindow:    true,
+		CreationFlags: 0x08000000, // CREATE_NO_WINDOW
+	}
+	if err := cmd.Run(); err != nil {
+		log.Printf("killClient: taskkill %s: %v (ok if not running)", exeName, err)
+		return
+	}
+	log.Printf("killClient: killed %s, waiting for handles to release", exeName)
+	time.Sleep(2 * time.Second)
+}
+
 // doUpdate downloads and applies an update, reporting progress to the GUI.
 // Used for both forced and user-accepted updates.
 func doUpdate(ctx context.Context, cfg *config.Config, client *updater.Client, m *updater.Manifest, g *gui.GUI) error {
@@ -386,6 +411,7 @@ func doUpdate(ctx context.Context, cfg *config.Config, client *updater.Client, m
 
 	g.SetState(gui.StateExtracting, nil)
 	g.ResetSpeed()
+	killClientIfRunning(cfg)
 	if err := updater.Apply(res.Path, cfg.CurrentDir(), cfg.BackupsDir(), cfg.StagingDir(), cfg.CurrentVersion,
 		func(done, total int64) { g.SetProgress(done, total) }); err != nil {
 		return fmt.Errorf("apply: %w", err)
@@ -490,6 +516,7 @@ func doForcedUpdateHeadless(ctx context.Context, cfg *config.Config, client *upd
 	}
 	log.Printf("downloaded %s in %s (sha256 ok)", res.Path, res.Duration)
 
+	killClientIfRunning(cfg)
 	if err := updater.Apply(res.Path, cfg.CurrentDir(), cfg.BackupsDir(), cfg.StagingDir(), cfg.CurrentVersion, nil); err != nil {
 		return fmt.Errorf("apply: %w", err)
 	}
