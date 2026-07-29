@@ -4,7 +4,7 @@ Bootstrap updater for the SynteeHelper desktop client (Windows).
 
 `syntee-launcher.exe` is the single entry point of a SynteeHelper install:
 shortcuts, the Start Menu, and the `HKCU\...\Run` autostart key all point at
-this binary, **never** at `SynteeHelper.exe`. On every launch it:
+this binary, **never** at `Syntee Helper.exe`. On every launch it:
 
 1. **Crash-loop recovery** — if the current version is in `bad_versions`,
    restores the most recent backup before doing anything else.
@@ -16,7 +16,7 @@ this binary, **never** at `SynteeHelper.exe`. On every launch it:
      shows progress, the update is applied before the client starts.
    - `force=false` → **background**: the zip is staged in `staging/` and
      applied on the next launch (after `app.quit()` from the in-app updater).
-4. **Run** — spawns `current/SynteeHelper.exe`, waits for it to exit, loops.
+4. **Run** — spawns `current/Syntee Helper.exe`, waits for it to exit, loops.
    A crash-marker (`.crash_marker`) written before spawn and deleted by the
    client on ready-state lets the launcher detect crashes and, after 3
    consecutive crash-loops, restore the backup and mark the version bad.
@@ -29,7 +29,7 @@ this binary, **never** at `SynteeHelper.exe`. On every launch it:
 ├── launcher.json                ← config: channel, current_version, bad_versions, ...
 ├── syntee-launcher.log          ← diagnostic log (created on first run)
 ├── current/                     ← active client build
-│   ├── SynteeHelper.exe
+│   ├── Syntee Helper.exe
 │   └── ...
 ├── backups/                     ← previous versions (for rollback)
 │   └── 0.1.0_<unix_ts>/
@@ -51,7 +51,7 @@ this binary, **never** at `SynteeHelper.exe`. On every launch it:
   "max_crash_retries": 3,
   "check_timeout_sec": 5,
   "download_timeout_sec": 0,
-  "client_exe": "SynteeHelper.exe",
+  "client_exe": "Syntee Helper.exe",
   "ready_marker": ".ready"
 }
 ```

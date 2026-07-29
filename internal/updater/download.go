@@ -43,8 +43,32 @@ func (c *Client) DownloadToStaging(ctx context.Context, m *Manifest, stagingDir 
 		}
 	}
 
-	// Open destination for resume: O_CREATE|O_WRONLY, append to existing bytes.
-	f, err := os.OpenFile(dest, os.O_CREATE|os.O_WRONLY, 0o644)
+	// Try up to 2 attempts: first with resume, then fresh (delete + retry).
+	for attempt := 0; attempt < 2; attempt++ {
+		if attempt > 0 {
+			// Second attempt: delete any corrupt partial file and start fresh.
+			_ = os.Remove(dest)
+		}
+		res, err := c.downloadOnce(ctx, m, dest, onProgress, attempt == 0)
+		if err == nil {
+			return res, nil
+		}
+		// On size/hash mismatch, retry. On other errors (network), also retry once.
+		if attempt == 0 {
+			// Log and retry — the second attempt will delete the file.
+			continue
+		}
+		return nil, err
+	}
+	return nil, fmt.Errorf("download failed after retry")
+}
+
+// downloadOnce performs a single download attempt. If resume is true and a
+// partial file exists, it tries to resume via HTTP Range.
+func (c *Client) downloadOnce(ctx context.Context, m *Manifest, dest string, onProgress func(downloaded int64, total int64), resume bool) (*DownloadResult, error) {
+	// Open destination: O_RDWR because we need to read back the existing
+	// prefix for SHA256 verification on resume.
+	f, err := os.OpenFile(dest, os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
 		return nil, fmt.Errorf("open staging file: %w", err)
 	}
@@ -57,6 +81,17 @@ func (c *Client) DownloadToStaging(ctx context.Context, m *Manifest, stagingDir 
 
 	// If we already have the full size (or more — corrupt), restart fresh.
 	if existing >= m.ZipSize {
+		if err := f.Truncate(0); err != nil {
+			return nil, fmt.Errorf("truncate staging file: %w", err)
+		}
+		if _, err := f.Seek(0, io.SeekStart); err != nil {
+			return nil, fmt.Errorf("rewind staging file: %w", err)
+		}
+		existing = 0
+	}
+
+	// If not resuming (second attempt), always start from scratch.
+	if !resume && existing > 0 {
 		if err := f.Truncate(0); err != nil {
 			return nil, fmt.Errorf("truncate staging file: %w", err)
 		}
@@ -149,6 +184,9 @@ func (c *Client) DownloadToStaging(ctx context.Context, m *Manifest, stagingDir 
 
 	got := hex.EncodeToString(sha.Sum(nil))
 	if got != m.SHA256 {
+		// Hash mismatch — the resumed file is corrupt. Delete and retry
+		// from scratch (no resume) once before giving up.
+		_ = os.Remove(dest)
 		return nil, fmt.Errorf("sha256 mismatch: got %s, expected %s", got, m.SHA256)
 	}
 

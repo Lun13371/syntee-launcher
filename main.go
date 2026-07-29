@@ -1,11 +1,19 @@
-// Command syntee-launcher is the bootstrap updater for SynteeHelper.
+// Command syntee-launcher is the installer and updater for SynteeHelper.
 //
-// It is the single entry point for the desktop install: shortcuts and the Run
-// registry key point at this binary, never at SynteeHelper.exe. On every
-// launch it (1) checks for crash-loop recovery, (2) asks the gateway whether
-// a newer build exists for its channel, (3) applies the update if one is
-// available (blocking when force, background when not), and (4) spawns the
-// client and waits for it to exit before looping.
+// The user downloads this binary (7 MB) from the gateway, runs it, and it
+// self-installs to %LOCALAPPDATA%\Programs\Syntee Helper\. It then downloads
+// the full client zip (~400 MB), extracts it, creates shortcuts pointing at
+// the client exe, and launches it.
+//
+// Shortcuts, autostart and the uninstall registry entry point at the client
+// ("Syntee Helper.exe"), not at this launcher. The launcher is only run
+// explicitly by the user to install, update, or repair.
+//
+// The launcher has two UI modes:
+//   - GUI mode (default): a WebView2-based glassmorphism window with animated
+//     progress, changelog display, and user decision buttons.
+//   - Headless mode (fallback): the old MessageBox-based UI, used when
+//     WebView2 is unavailable.
 package main
 
 import (
@@ -14,29 +22,55 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
 	"github.com/Lun13371/syntee-launcher/internal/config"
+	"github.com/Lun13371/syntee-launcher/internal/gui"
 	"github.com/Lun13371/syntee-launcher/internal/rollback"
-	"github.com/Lun13371/syntee-launcher/internal/runner"
+	"github.com/Lun13371/syntee-launcher/internal/setup"
 	"github.com/Lun13371/syntee-launcher/internal/ui"
 	"github.com/Lun13371/syntee-launcher/internal/updater"
 )
 
-// jsonMarshal / jsonUnmarshal are thin wrappers so main.go doesn't import
-// encoding/json directly in multiple places — keeps the imports tidy.
-func jsonMarshal(v any) ([]byte, error) { return json.MarshalIndent(v, "", "  ") }
+func jsonMarshal(v any) ([]byte, error)    { return json.MarshalIndent(v, "", "  ") }
 func jsonUnmarshal(data []byte, v any) error { return json.Unmarshal(data, v) }
 
 func main() {
-	// The launcher runs with -H windowsgui so there's no console. Route logs
-	// to a file next to the binary so crashes are diagnosable.
 	initLogging()
 	defer logSync()
 
-	log.Printf("syntee-launcher starting (pid=%d)", os.Getpid())
+	log.Printf("syntee-launcher starting (pid=%d, args=%v)", os.Getpid(), os.Args[1:])
+
+	// --uninstall: no GUI, use MessageBox.
+	for _, arg := range os.Args[1:] {
+		if arg == "--uninstall" || arg == "-uninstall" {
+			cfg, err := config.Load()
+			if err != nil {
+				ui.ShowError("Syntee Helper", "Не удалось прочитать конфигурацию: "+err.Error())
+				os.Exit(1)
+			}
+			quiet := false
+			for _, a := range os.Args[1:] {
+				if a == "--quiet" || a == "-quiet" {
+					quiet = true
+				}
+			}
+			setup.Uninstall(cfg, quiet)
+			return
+		}
+	}
+
+	// Self-install: if not running from the install dir, copy ourselves
+	// to %LOCALAPPDATA%\Programs\Syntee Helper\ and relaunch from there.
+	// This makes the launcher behave like a normal installer when the user
+	// downloads it to Downloads and double-clicks.
+	if selfInstall() {
+		return // relaunch happened, exit this temp copy
+	}
 
 	cfg, err := config.Load()
 	if err != nil {
@@ -44,13 +78,95 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Step 1: crash-loop recovery. If the current version is in bad_versions,
-	// restore the most recent backup before doing anything else.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go handleSignals(cancel)
+
+	client := updater.NewClient(cfg)
+
+	// Try GUI mode. If WebView2 is unavailable and can't be installed,
+	// fall back to the headless MessageBox UI.
+	g, err := gui.New()
+	if err != nil {
+		log.Printf("GUI init failed, falling back to headless: %v", err)
+		runHeadless(ctx, cfg, client)
+		return
+	}
+
+	g.SetVerifyConfig(cfg)
+
+	g.Run(func() {
+		runLifecycle(ctx, cfg, client, g)
+	})
+}
+
+// runLifecycle is the GUI-mode lifecycle. It runs in a goroutine alongside
+// the webview message loop. State changes are pushed to the frontend via
+// g.SetState / g.SetProgress.
+func runLifecycle(ctx context.Context, cfg *config.Config, client *updater.Client, g *gui.GUI) {
+	// ── 1. First-run setup ──────────────────────────────────────────────
+	needsInstall := false
+	if _, err := os.Stat(cfg.ClientExePath()); err != nil {
+		needsInstall = true
+	}
+
+	if needsInstall {
+		// Show welcome screen with install options; wait for user to click "Install".
+		g.SetState(gui.StateWelcome, &gui.Payload{
+			Title: cfg.Dir(),
+		})
+		installOpts := <-g.InstallCh()
+		log.Printf("install options: desktop=%v startmenu=%v autostart=%v",
+			installOpts.DesktopShortcut, installOpts.StartMenuShortcut, installOpts.Autostart)
+
+		g.SetState(gui.StateDownloading, &gui.Payload{
+			Title:      "Установка Syntee Helper",
+			IsFirstRun: true,
+		})
+		g.ResetSpeed()
+
+		for {
+			err := setup.RunIfNeededWithOptions(ctx, cfg, client, setup.InstallOptions{
+				DesktopShortcut:   installOpts.DesktopShortcut,
+				StartMenuShortcut: installOpts.StartMenuShortcut,
+				Autostart:         installOpts.Autostart,
+			},
+				g.SetProgress,
+				func(phase string) {
+					switch phase {
+					case "download":
+					case "extract":
+						g.SetState(gui.StateExtracting, nil)
+						g.ResetSpeed()
+					}
+				},
+			)
+			if err != nil {
+				log.Printf("first-run setup failed: %v", err)
+				g.SetState(gui.StateError, &gui.Payload{
+					ErrorMessage: "Не удалось загрузить клиент с сервера.\n\n" +
+						"Проверьте подключение к интернету.\n\n" +
+						"Ошибка: " + err.Error(),
+				})
+				<-g.RetryCh()
+				g.ResetSpeed()
+				g.SetState(gui.StateDownloading, &gui.Payload{IsFirstRun: true})
+				continue
+			}
+			break
+		}
+
+		// Installation complete — launch client with countdown.
+		launchClientAndCountdown(cfg, g)
+		return
+	}
+
+	// ── 2. Already installed: check for updates ─────────────────────────
+	g.SetState(gui.StateChecking, nil)
+
+	// Crash-loop recovery: if current version is marked bad, restore backup.
 	if restored, rerr := rollback.RestoreIfBad(cfg); rerr != nil {
 		log.Printf("rollback failed: %v", rerr)
-		ui.ShowError("Syntee Launcher",
-			fmt.Sprintf("The current version (%s) is marked as broken and no backup could be restored.\n\nPlease reinstall SynteeHelper manually.", cfg.CurrentVersion))
-		os.Exit(1)
 	} else if restored != "" {
 		log.Printf("restored previous version %s after crash-loop", restored)
 		if err := cfg.Save(); err != nil {
@@ -58,203 +174,333 @@ func main() {
 		}
 	}
 
-	// Step 2: check for an update. Offline-first — a failed check never
-	// blocks the client from starting.
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go handleSignals(cancel)
-
-	client := updater.NewClient(cfg)
 	manifest, err := client.Check(ctx, cfg.Channel, cfg.CurrentVersion)
 	if err != nil {
-		log.Printf("update check failed (offline?): %v — starting current version", err)
-	} else if manifest != nil && updater.IsNewer(cfg.CurrentVersion, manifest.Version) {
+		log.Printf("update check failed: %v", err)
+	}
+
+	if err == nil && manifest != nil && updater.IsNewer(cfg.CurrentVersion, manifest.Version) {
 		log.Printf("update available: %s -> %s (force=%v)", cfg.CurrentVersion, manifest.Version, manifest.Force)
 		if manifest.Force {
-			// Blocking update: show progress, download, apply, then start
-			// the freshly-installed version.
-			if err := doForcedUpdate(ctx, cfg, client, manifest); err != nil {
-				log.Printf("forced update failed: %v — falling back to current", err)
-				// Don't exit: start the current build so the user isn't stuck.
+			g.SetState(gui.StateForcedUpdate, &gui.Payload{
+				Version: manifest.Version,
+				Force:   true,
+			})
+			g.ResetSpeed()
+			if err := doUpdate(ctx, cfg, client, manifest, g); err != nil {
+				log.Printf("forced update failed: %v", err)
+				g.SetState(gui.StateError, &gui.Payload{
+					ErrorMessage: "Ошибка обновления: " + err.Error(),
+				})
+				<-g.RetryCh()
+				os.Exit(1)
 			}
 		} else {
-			// Non-force: try a background download into staging/ so the next
-			// launch can apply it instantly. Failure here is non-fatal.
-			if err := tryBackgroundDownload(ctx, cfg, client, manifest); err != nil {
-				log.Printf("background download failed (will retry next launch): %v", err)
-			}
-		}
-	} else {
-		log.Printf("no update available (current=%s)", cfg.CurrentVersion)
-	}
-
-	// Step 3: apply any staging update that was prepared during a previous
-	// non-force run (zip already verified in staging).
-	applyStagingIfReady(cfg)
-
-	// Step 4: spawn the client.
-	for {
-		if err := runClientOnce(ctx, cfg); err != nil {
-			log.Printf("client run error: %v", err)
-		}
-		// Loop: after the client exits, check for updates again (the user may
-		// have accepted an update inside the app → app.quit() → we loop).
-		// A short delay prevents a tight spin loop if the client keeps dying.
-		time.Sleep(1 * time.Second)
-
-		// Re-check for an update before relaunching.
-		manifest, err := client.Check(ctx, cfg.Channel, cfg.CurrentVersion)
-		if err == nil && manifest != nil && updater.IsNewer(cfg.CurrentVersion, manifest.Version) {
-			if manifest.Force {
-				if err := doForcedUpdate(ctx, cfg, client, manifest); err != nil {
-					log.Printf("forced update (relaunch): %v", err)
+			g.SetState(gui.StateUpdateAvailable, &gui.Payload{
+				Version:   manifest.Version,
+				Changelog: manifest.Changelog,
+			})
+			if <-g.DecisionCh() {
+				g.SetState(gui.StateDownloading, &gui.Payload{
+					Version: manifest.Version,
+				})
+				g.ResetSpeed()
+				if err := doUpdate(ctx, cfg, client, manifest, g); err != nil {
+					log.Printf("update failed: %v", err)
+					g.SetState(gui.StateError, &gui.Payload{
+						ErrorMessage: "Ошибка обновления: " + err.Error(),
+					})
+					<-g.RetryCh()
+					os.Exit(1)
 				}
 			} else {
-				_ = tryBackgroundDownload(ctx, cfg, client, manifest)
-				applyStagingIfReady(cfg)
+				// User declined update — show installed screen.
+				showInstalledScreen(ctx, cfg, client, g)
+				return
 			}
 		}
+
+		// Update complete — launch client with countdown.
+		launchClientAndCountdown(cfg, g)
+		return
+	}
+
+	log.Printf("no update available (current=%s)", cfg.CurrentVersion)
+	showInstalledScreen(ctx, cfg, client, g)
+}
+
+// showInstalledScreen displays the "already installed" management screen and
+// handles reinstall requests.
+func showInstalledScreen(ctx context.Context, cfg *config.Config, client *updater.Client, g *gui.GUI) {
+	g.SetState(gui.StateInstalled, &gui.Payload{
+		Title:   cfg.Dir(),
+		Version: cfg.CurrentVersion,
+	})
+
+	for {
+		select {
+		case <-g.LaunchCh():
+			launchClientAndCountdown(cfg, g)
+			return
+		case <-g.ReinstallCh():
+			log.Printf("reinstall requested")
+			g.SetState(gui.StateDownloading, &gui.Payload{
+				Title:      "Переустановка Syntee Helper",
+				IsFirstRun: true,
+			})
+			g.ResetSpeed()
+
+			// Fetch latest manifest (use "0.0.0" to always get a result).
+			manifest, err := client.Check(ctx, cfg.Channel, "0.0.0")
+			if err != nil {
+				log.Printf("reinstall: fetch manifest: %v", err)
+				g.SetState(gui.StateError, &gui.Payload{
+					ErrorMessage: "Не удалось получить информацию о версии.\n\n" + err.Error(),
+				})
+				<-g.RetryCh()
+				g.SetState(gui.StateInstalled, &gui.Payload{
+					Title:   cfg.Dir(),
+					Version: cfg.CurrentVersion,
+				})
+				continue
+			}
+			if manifest == nil {
+				g.SetState(gui.StateError, &gui.Payload{
+					ErrorMessage: "Нет доступной версии для установки.",
+				})
+				<-g.RetryCh()
+				g.SetState(gui.StateInstalled, &gui.Payload{
+					Title:   cfg.Dir(),
+					Version: cfg.CurrentVersion,
+				})
+				continue
+			}
+
+		if err := doUpdate(ctx, cfg, client, manifest, g); err != nil {
+			log.Printf("reinstall failed: %v", err)
+			g.SetState(gui.StateError, &gui.Payload{
+				ErrorMessage: "Ошибка переустановки: " + err.Error(),
+			})
+			<-g.RetryCh()
+			g.SetState(gui.StateInstalled, &gui.Payload{
+				Title:   cfg.Dir(),
+				Version: cfg.CurrentVersion,
+			})
+			continue
+		}
+
+		// Recreate shortcuts pointing to client (not launcher).
+		if err := setup.RecreateShortcuts(cfg); err != nil {
+			log.Printf("reinstall: recreate shortcuts: %v", err)
+		}
+
+		// Reinstall complete — launch client with countdown.
+		launchClientAndCountdown(cfg, g)
+		return
+		}
 	}
 }
 
-// runClientOnce spawns the client, waits for it to exit, and updates the
-// crash counter based on whether it reached ready-state.
-func runClientOnce(ctx context.Context, cfg *config.Config) error {
-	runCtx, runCancel := context.WithCancel(ctx)
-	defer runCancel()
-
-	runErr := runner.Run(runCtx, cfg)
-	if runErr != nil {
-		log.Printf("client exited with error: %v", runErr)
+// launchClientDetached starts the client process detached so it survives
+// launcher exit. Used by the headless fallback (no GUI countdown).
+func launchClientDetached(cfg *config.Config) {
+	exe := cfg.ClientExePath()
+	if _, err := os.Stat(exe); err != nil {
+		log.Printf("headless launch: client exe not found: %v", err)
+		return
 	}
-
-	// Did the client reach ready-state?
-	if runner.ReachedReady(cfg) {
-		cfg.ResetCrashCount()
-		runner.MarkReady(cfg)
-		if err := cfg.Save(); err != nil {
-			log.Printf("save config after ready: %v", err)
-		}
-		return runErr
+	cmd := exec.Command(exe)
+	cmd.Dir = cfg.CurrentDir()
+	cmd.Stdin = nil
+	cmd.Stdout = nil
+	cmd.Stderr = nil
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		CreationFlags: syscall.CREATE_NEW_PROCESS_GROUP | 0x00000008, // DETACHED_PROCESS
 	}
-
-	// Crash before ready — bump the counter.
-	count := cfg.IncrementCrashCount()
-	log.Printf("client crashed before ready (count=%d/%d)", count, cfg.MaxCrashRetries)
-	if err := cfg.Save(); err != nil {
-		log.Printf("save config after crash: %v", err)
+	if err := cmd.Start(); err != nil {
+		log.Printf("headless launch: failed to start client: %v", err)
+		return
 	}
-
-	if count >= cfg.MaxCrashRetries {
-		log.Printf("crash limit reached — marking %s as bad and restoring backup", cfg.CurrentVersion)
-		cfg.AddBadVersion(cfg.CurrentVersion)
-		if restored, rerr := rollback.RestoreIfBad(cfg); rerr != nil {
-			log.Printf("restore after crash-loop: %v", rerr)
-			ui.ShowError("Syntee Launcher",
-				fmt.Sprintf("SynteeHelper (%s) keeps crashing and no backup is available.\n\nPlease reinstall manually.", cfg.CurrentVersion))
-			os.Exit(1)
-		} else if restored != "" {
-			log.Printf("restored %s after crash-loop", restored)
-		}
-		if err := cfg.Save(); err != nil {
-			log.Printf("save config after restore: %v", err)
-		}
-	}
-	return runErr
+	log.Printf("headless: launched client (pid=%d)", cmd.Process.Pid)
+	_ = cmd.Process.Release()
 }
 
-// doForcedUpdate downloads and applies an update synchronously, showing a
-// progress dialog to the user.
-func doForcedUpdate(ctx context.Context, cfg *config.Config, client *updater.Client, m *updater.Manifest) error {
-	ui.ShowForceProgress("Downloading required update " + m.Version + "…")
-	defer ui.DismissForceProgress()
+// launchClientAndCountdown launches the client detached, shows a countdown
+// screen, and terminates the launcher after 10 seconds.
+func launchClientAndCountdown(cfg *config.Config, g *gui.GUI) {
+	exe := cfg.ClientExePath()
+	if _, err := os.Stat(exe); err != nil {
+		log.Printf("launch: client exe not found: %v", err)
+		g.SetState(gui.StateError, &gui.Payload{
+			ErrorMessage: "Клиент не найден. Переустановите приложение.",
+		})
+		<-g.RetryCh()
+		return
+	}
 
+	// Launch client detached so it survives launcher exit.
+	cmd := exec.Command(exe)
+	cmd.Dir = cfg.CurrentDir()
+	cmd.Stdin = nil
+	cmd.Stdout = nil
+	cmd.Stderr = nil
+	// CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS so the client is independent.
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		CreationFlags: syscall.CREATE_NEW_PROCESS_GROUP | 0x00000008, // DETACHED_PROCESS
+	}
+	if err := cmd.Start(); err != nil {
+		log.Printf("launch: failed to start client: %v", err)
+		g.SetState(gui.StateError, &gui.Payload{
+			ErrorMessage: "Не удалось запустить клиент: " + err.Error(),
+		})
+		<-g.RetryCh()
+		return
+	}
+	log.Printf("launched client (pid=%d)", cmd.Process.Pid)
+	// Release the process so it doesn't become a zombie when we exit.
+	_ = cmd.Process.Release()
+
+	// Show countdown screen.
+	g.SetState(gui.StateLaunching, nil)
+
+	// Countdown 10 seconds, then terminate.
+	for i := 10; i > 0; i-- {
+		g.SetCountdown(i)
+		time.Sleep(1 * time.Second)
+	}
+
+	log.Printf("countdown finished, exiting launcher")
+	g.Terminate()
+}
+
+// doUpdate downloads and applies an update, reporting progress to the GUI.
+// Used for both forced and user-accepted updates.
+func doUpdate(ctx context.Context, cfg *config.Config, client *updater.Client, m *updater.Manifest, g *gui.GUI) error {
 	res, err := client.DownloadToStaging(ctx, m, cfg.StagingDir(), func(done, total int64) {
-		ui.ShowForceProgress("Downloading required update " + m.Version + "…\n" + ui.FormatPercent(done, total))
+		g.SetProgress(done, total)
 	})
 	if err != nil {
 		return fmt.Errorf("download: %w", err)
 	}
 	log.Printf("downloaded %s in %s (sha256 ok)", res.Path, res.Duration)
 
-	if err := updater.Apply(res.Path, cfg.CurrentDir(), cfg.BackupsDir(), cfg.StagingDir(), cfg.CurrentVersion); err != nil {
+	g.SetState(gui.StateExtracting, nil)
+	g.ResetSpeed()
+	if err := updater.Apply(res.Path, cfg.CurrentDir(), cfg.BackupsDir(), cfg.StagingDir(), cfg.CurrentVersion,
+		func(done, total int64) { g.SetProgress(done, total) }); err != nil {
+		return fmt.Errorf("apply: %w", err)
+	}
+
+	cfg.SetCurrentVersion(m.Version)
+	if err := cfg.Save(); err != nil {
+		log.Printf("save config after apply: %v", err)
+	}
+	copyUpdaterAfterApply(cfg)
+	_ = os.Remove(filepath.Join(cfg.StagingDir(), "update.json"))
+	log.Printf("applied update -> %s", m.Version)
+	return nil
+}
+
+// copyUpdaterAfterApply copies the launcher exe into current/updater.exe
+// after an update. The client uses updater.exe to self-heal if the main
+// launcher is missing.
+func copyUpdaterAfterApply(cfg *config.Config) {
+	exePath, err := os.Executable()
+	if err != nil {
+		log.Printf("copyUpdater: %v", err)
+		return
+	}
+	dst := filepath.Join(cfg.CurrentDir(), "updater.exe")
+	data, err := os.ReadFile(exePath)
+	if err != nil {
+		log.Printf("copyUpdater: read: %v", err)
+		return
+	}
+	if err := os.WriteFile(dst, data, 0o755); err != nil {
+		log.Printf("copyUpdater: write: %v", err)
+		return
+	}
+	log.Printf("copyUpdater: copied -> %s", dst)
+}
+
+// ── Headless fallback (old MessageBox UI) ──────────────────────────────
+
+func runHeadless(ctx context.Context, cfg *config.Config, client *updater.Client) {
+	var headlessMsg string
+
+	onProgress := func(done, total int64) {
+		ui.ShowForceProgress(headlessMsg + "\n" + ui.FormatPercent(done, total))
+	}
+	onPhase := func(phase string) {
+		switch phase {
+		case "download":
+			headlessMsg = "Загрузка клиента…"
+			ui.ShowForceProgress(headlessMsg)
+		case "extract":
+			headlessMsg = "Распаковка…"
+		}
+	}
+
+	if err := setup.RunIfNeeded(ctx, cfg, client, onProgress, onPhase); err != nil {
+		log.Printf("first-run setup failed: %v", err)
+		ui.ShowError("Syntee Helper — установка",
+			"Не удалось загрузить клиент с сервера.\n\n"+
+				"Проверьте подключение к интернету и попробуйте снова.\n\n"+
+				"Ошибка: "+err.Error())
+		os.Exit(1)
+	}
+
+	if restored, rerr := rollback.RestoreIfBad(cfg); rerr != nil {
+		log.Printf("rollback failed: %v", rerr)
+	} else if restored != "" {
+		log.Printf("restored previous version %s after crash-loop", restored)
+		if err := cfg.Save(); err != nil {
+			log.Printf("save config after restore: %v", err)
+		}
+	}
+
+	manifest, err := client.Check(ctx, cfg.Channel, cfg.CurrentVersion)
+	if err != nil {
+		log.Printf("update check failed: %v", err)
+	} else if manifest != nil && updater.IsNewer(cfg.CurrentVersion, manifest.Version) {
+		log.Printf("update available: %s -> %s (force=%v)", cfg.CurrentVersion, manifest.Version, manifest.Force)
+		if manifest.Force {
+			if err := doForcedUpdateHeadless(ctx, cfg, client, manifest); err != nil {
+				log.Printf("forced update failed: %v", err)
+			}
+		}
+	} else {
+		log.Printf("no update available (current=%s)", cfg.CurrentVersion)
+	}
+
+	// Launch the client (detached) so the user gets the app running.
+	launchClientDetached(cfg)
+
+	log.Printf("launcher done, exiting")
+}
+
+func doForcedUpdateHeadless(ctx context.Context, cfg *config.Config, client *updater.Client, m *updater.Manifest) error {
+	ui.ShowForceProgress("Загрузка обновления " + m.Version + "…")
+
+	res, err := client.DownloadToStaging(ctx, m, cfg.StagingDir(), func(done, total int64) {
+		ui.ShowForceProgress("Загрузка обновления " + m.Version + "…\n" + ui.FormatPercent(done, total))
+	})
+	if err != nil {
+		return fmt.Errorf("download: %w", err)
+	}
+	log.Printf("downloaded %s in %s (sha256 ok)", res.Path, res.Duration)
+
+	if err := updater.Apply(res.Path, cfg.CurrentDir(), cfg.BackupsDir(), cfg.StagingDir(), cfg.CurrentVersion, nil); err != nil {
 		return fmt.Errorf("apply: %w", err)
 	}
 	cfg.SetCurrentVersion(m.Version)
 	if err := cfg.Save(); err != nil {
 		log.Printf("save config after apply: %v", err)
 	}
-	// Remove the staged manifest so a later applyStagingIfReady doesn't redo it.
-	_ = os.Remove(cfg.StagingDir() + string(os.PathSeparator) + "update.json")
+	copyUpdaterAfterApply(cfg)
+	_ = os.Remove(filepath.Join(cfg.StagingDir(), "update.json"))
 	log.Printf("applied update -> %s", m.Version)
 	return nil
-}
-
-// tryBackgroundDownload fetches the zip into staging/ without applying it.
-// The next launch (or an app.quit() from the in-app updater) picks it up via
-// applyStagingIfReady. The manifest is cached alongside the zip so the applier
-// can bump current_version and verify integrity without re-querying the server.
-func tryBackgroundDownload(ctx context.Context, cfg *config.Config, client *updater.Client, m *updater.Manifest) error {
-	res, err := client.DownloadToStaging(ctx, m, cfg.StagingDir(), nil)
-	if err != nil {
-		return err
-	}
-	// Persist the manifest next to the zip so applyStagingIfReady can pick it
-	// up on the next launch without a network round-trip.
-	manifestPath := cfg.StagingDir() + string(os.PathSeparator) + "update.json"
-	manifestJSON, _ := jsonMarshal(m)
-	_ = os.WriteFile(manifestPath, manifestJSON, 0o644)
-	log.Printf("background download ready: %s (sha256 verified, manifest cached)", res.Path)
-	return nil
-}
-
-// applyStagingIfReady checks for a verified staging/update.zip and applies it.
-// This covers the non-force flow: previous launch downloaded in the
-// background, this launch swaps it in. Requires staging/update.json to be
-// present alongside the zip — without it we can't know the target version
-// and we skip (the next check will re-download).
-func applyStagingIfReady(cfg *config.Config) {
-	zipPath := cfg.StagingDir() + string(os.PathSeparator) + "update.zip"
-	manifestPath := cfg.StagingDir() + string(os.PathSeparator) + "update.json"
-
-	info, err := os.Stat(zipPath)
-	if err != nil || info.Size() == 0 {
-		return
-	}
-	manifestRaw, err := os.ReadFile(manifestPath)
-	if err != nil {
-		log.Printf("staged zip present but update.json missing — skipping apply")
-		return
-	}
-	var m updater.Manifest
-	if err := jsonUnmarshal(manifestRaw, &m); err != nil {
-		log.Printf("parse staged manifest: %v — removing stale staging", err)
-		_ = os.Remove(zipPath)
-		_ = os.Remove(manifestPath)
-		return
-	}
-	// If the staged version is already current, the previous launch applied
-	// it but didn't clean up staging — drop the stale zip.
-	if m.Version == cfg.CurrentVersion {
-		_ = os.Remove(zipPath)
-		_ = os.Remove(manifestPath)
-		return
-	}
-
-	log.Printf("applying staged update %s -> %s from %s", cfg.CurrentVersion, m.Version, zipPath)
-	if err := updater.Apply(zipPath, cfg.CurrentDir(), cfg.BackupsDir(), cfg.StagingDir(), cfg.CurrentVersion); err != nil {
-		log.Printf("apply staging failed: %v — removing stale zip", err)
-		_ = os.Remove(zipPath)
-		_ = os.Remove(manifestPath)
-		return
-	}
-	cfg.SetCurrentVersion(m.Version)
-	if err := cfg.Save(); err != nil {
-		log.Printf("save config after staged apply: %v", err)
-	}
-	_ = os.Remove(zipPath)
-	_ = os.Remove(manifestPath)
-	log.Printf("staged update applied -> %s", m.Version)
 }
 
 func handleSignals(cancel context.CancelFunc) {
@@ -276,7 +522,6 @@ func initLogging() {
 	}
 	f, err := os.OpenFile(exe[:len(exe)-len(".exe")]+".log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
-		// Fall back to no logging — better than crashing on a permission issue.
 		log.SetOutput(os.NewFile(0, os.DevNull))
 		return
 	}

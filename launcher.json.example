@@ -8,6 +8,6 @@
   "max_crash_retries": 3,
   "check_timeout_sec": 5,
   "download_timeout_sec": 0,
-  "client_exe": "SynteeHelper.exe",
+  "client_exe": "Syntee Helper.exe",
   "ready_marker": ".ready"
 }

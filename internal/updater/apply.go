@@ -22,7 +22,10 @@ import (
 //
 // If step 2 fails (e.g. current/ missing on first install) we proceed anyway.
 // If step 3 fails we attempt to restore from the backup we just made.
-func Apply(zipPath, currentDir, backupsDir, stagingDir, oldVersion string) error {
+//
+// onProgress, if non-nil, is called with (bytesExtracted, totalUncompressedBytes)
+// during the unzip phase so the GUI can show extraction progress.
+func Apply(zipPath, currentDir, backupsDir, stagingDir, oldVersion string, onProgress func(extracted, total int64)) error {
 	newDir := filepath.Join(stagingDir, "new")
 	// Clean any leftover from a previous attempt.
 	os.RemoveAll(newDir)
@@ -30,7 +33,7 @@ func Apply(zipPath, currentDir, backupsDir, stagingDir, oldVersion string) error
 		return fmt.Errorf("create new dir: %w", err)
 	}
 
-	if err := unzip(zipPath, newDir); err != nil {
+	if err := unzip(zipPath, newDir, onProgress); err != nil {
 		return fmt.Errorf("unzip: %w", err)
 	}
 
@@ -65,13 +68,28 @@ func Apply(zipPath, currentDir, backupsDir, stagingDir, oldVersion string) error
 // unzip extracts every entry of a zip archive into dst. It rejects absolute
 // paths and ".." traversal to prevent writing outside dst (zip-slip). File
 // permissions are preserved on Unix; on Windows the mode bits are ignored.
-func unzip(zipPath, dst string) error {
+//
+// onProgress, if non-nil, receives (bytesExtracted, totalUncompressed) where
+// total is the sum of all file UncompressedSize64 values. The first pass
+// computes the total; the second pass extracts and reports progress.
+func unzip(zipPath, dst string, onProgress func(extracted, total int64)) error {
 	r, err := zip.OpenReader(zipPath)
 	if err != nil {
 		return err
 	}
 	defer r.Close()
 
+	// First pass: compute total uncompressed size for progress reporting.
+	var total int64
+	if onProgress != nil {
+		for _, f := range r.File {
+			if !f.FileInfo().IsDir() {
+				total += int64(f.UncompressedSize64)
+			}
+		}
+	}
+
+	var extracted int64
 	for _, f := range r.File {
 		name, err := safeJoin(dst, f.Name)
 		if err != nil {
@@ -88,6 +106,10 @@ func unzip(zipPath, dst string) error {
 		}
 		if err := extractFile(f, name); err != nil {
 			return fmt.Errorf("extract %s: %w", f.Name, err)
+		}
+		if onProgress != nil && !f.FileInfo().IsDir() {
+			extracted += int64(f.UncompressedSize64)
+			onProgress(extracted, total)
 		}
 	}
 	return nil

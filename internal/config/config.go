@@ -1,7 +1,6 @@
 // Package config reads and writes launcher.json — the single source of truth
-// for the launcher's persistent state. The file lives next to the launcher
-// binary so that the whole install directory is self-contained and a clean
-// uninstall is just "delete the folder".
+// for the launcher's persistent state. The install lives in
+// %LOCALAPPDATA%\Programs\Syntee Helper\ (user-level, no admin needed).
 package config
 
 import (
@@ -11,6 +10,33 @@ import (
 	"path/filepath"
 	"sync"
 )
+
+// DefaultUpdateServer is baked into the binary so the launcher can bootstrap
+// on first run (before launcher.json exists). Override with launcher.json
+// after install. Can be changed at build time via -ldflags:
+//   -ldflags "-X github.com/Lun13371/syntee-launcher/internal/config.DefaultUpdateServer=https://..."
+var DefaultUpdateServer = "http://localhost:8000/api/public/updates"
+
+// InstallDir returns the canonical install root:
+//   %LOCALAPPDATA%\Programs\Syntee Helper\
+// This is a user-level install (no admin elevation required).
+func InstallDir() string {
+	base := os.Getenv("LOCALAPPDATA")
+	if base == "" {
+		// Fallback: USERPROFILE\AppData\Local
+		base = filepath.Join(os.Getenv("USERPROFILE"), "AppData", "Local")
+	}
+	return filepath.Join(base, "Programs", "Syntee Helper")
+}
+
+// IsInstalled reports whether the launcher is running from the install dir.
+func IsInstalled() bool {
+	exe, err := os.Executable()
+	if err != nil {
+		return false
+	}
+	return filepath.Dir(exe) == InstallDir()
+}
 
 // Config mirrors launcher.json. All fields have json tags so the file is
 // human-editable. Defaults are applied by Load when the file is missing or
@@ -33,33 +59,22 @@ type Config struct {
 	dirty  bool
 }
 
-// Load reads launcher.json from the directory containing the running binary.
-// If the file is absent, a Config with sensible defaults is returned (and can
-// be persisted with Save). Missing fields in a partial file are filled in
-// with the same defaults.
+// Load reads launcher.json from the install directory. If the file is
+// absent, a Config with sensible defaults is returned.
 func Load() (*Config, error) {
-	exe, err := os.Executable()
-	if err != nil {
-		return nil, fmt.Errorf("determine executable path: %w", err)
-	}
-	dir := filepath.Dir(exe)
+	dir := InstallDir()
 	path := filepath.Join(dir, "launcher.json")
 
 	c := &Config{path: path}
 	raw, err := os.ReadFile(path)
 	switch {
 	case err == nil:
-		// Strip a UTF-8 BOM if present — Windows tools (Notepad, PowerShell
-		// Out-File) sometimes write one, and json.Unmarshal rejects it with
-		// "invalid character 'ï' looking for beginning of value".
 		raw = trimBOM(raw)
 		if err := json.Unmarshal(raw, c); err != nil {
 			return nil, fmt.Errorf("parse %s: %w", path, err)
 		}
 		c.applyDefaults()
 	case os.IsNotExist(err):
-		// First run — no config yet. Return defaults without writing; the
-		// installer (NSIS) is responsible for seeding the initial file.
 		c.applyDefaults()
 	default:
 		return nil, fmt.Errorf("read %s: %w", path, err)
@@ -68,6 +83,9 @@ func Load() (*Config, error) {
 }
 
 func (c *Config) applyDefaults() {
+	if c.UpdateServer == "" {
+		c.UpdateServer = DefaultUpdateServer
+	}
 	if c.Channel == "" {
 		c.Channel = "stable"
 	}
@@ -78,7 +96,7 @@ func (c *Config) applyDefaults() {
 		c.CheckTimeoutSec = 5
 	}
 	if c.ClientExe == "" {
-		c.ClientExe = "SynteeHelper.exe"
+		c.ClientExe = "Syntee Helper.exe"
 	}
 	if c.ReadyMarker == "" {
 		c.ReadyMarker = ".ready"
@@ -169,9 +187,9 @@ func (c *Config) IsBad(v string) bool {
 	return false
 }
 
-// Dir returns the directory containing launcher.json (i.e. the install root).
+// Dir returns the install root: %LOCALAPPDATA%\Programs\Syntee Helper\
 func (c *Config) Dir() string {
-	return filepath.Dir(c.path)
+	return InstallDir()
 }
 
 // CurrentDir is the "current/" subfolder holding the active client build.
