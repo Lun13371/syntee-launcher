@@ -14,7 +14,7 @@ set CLIENT_DIR=C:\Projects\SynteeHelper
 
 REM Production gateway URL - can be overridden by SYNTEE_GATEWAY_URL env var
 if "%SYNTEE_GATEWAY_URL%"=="" (
-    set GATEWAY_URL=https://gateway.syntee.dev/api/public/updates
+    set GATEWAY_URL=https://syntee.fun/api/public/updates
 ) else (
     set GATEWAY_URL=%SYNTEE_GATEWAY_URL%
 )
@@ -61,6 +61,30 @@ if exist "%GATEWAY_DIR%\backend\data\launcher" (
 )
 
 popd
+
+echo.
+echo  ------------------------------------------------------------
+echo  Step 3: Sync local launcher.json (so dev tests use this URL)
+echo  ------------------------------------------------------------
+echo.
+
+REM If a previous install left a launcher.json with a stale update_server
+REM (e.g. from dev.bat -> localhost:8000), the launcher reads it and IGNORES
+REM the freshly-baked DefaultUpdateServer (applyDefaults only fills an empty
+REM field). Rewrite the file so the new URL takes effect immediately.
+set INSTALL_DIR=%LOCALAPPDATA%\Programs\Syntee Helper
+if exist "%INSTALL_DIR%\launcher.json" (
+  echo  Updating existing launcher.json -> %GATEWAY_URL%
+  powershell -NoProfile -Command "$p='%INSTALL_DIR%\launcher.json'; $j=Get-Content $p -Raw | ConvertFrom-Json; $j.update_server='%GATEWAY_URL%'; $j | ConvertTo-Json -Depth 5 | Set-Content $p -Encoding UTF8"
+  if errorlevel 1 (
+    echo  [WARNING] Could not update launcher.json - delete it manually:
+    echo          %INSTALL_DIR%\launcher.json
+  ) else (
+    echo  [OK] launcher.json synced
+  )
+) else (
+  echo  launcher.json not present yet - launcher will create it on first run
+)
 
 echo.
 echo  ============================================================

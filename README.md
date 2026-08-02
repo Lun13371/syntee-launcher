@@ -42,7 +42,7 @@ this binary, **never** at `Syntee Helper.exe`. On every launch it:
 
 ```json
 {
-  "update_server": "https://gateway.syntee.dev/api/public/updates",
+  "update_server": "https://syntee.fun/api/public/updates",
   "channel": "stable",
   "current_version": "0.1.0",
   "pinned_version": null,
@@ -58,6 +58,24 @@ this binary, **never** at `Syntee Helper.exe`. On every launch it:
 
 The file lives next to the binary so the whole install is self-contained — a
 clean uninstall is just "delete the folder". A UTF-8 BOM is tolerated.
+
+## Self-healing
+
+Every launch (before any update check) the launcher repairs its own install:
+
+1. **`update_server` migration** — if `launcher.json` points at anything other
+   than the baked-in `DefaultUpdateServer` (e.g. the old raw IP from pre-domain
+   builds), it is forcibly rewritten to the baked default and saved. The JSON
+   wins over the baked default, so without this old installs would poll a dead
+   server forever.
+2. **`current/updater.exe` sync** — the running binary copies itself to
+   `current/updater.exe` on every launch (not only after applying an update),
+   atomically via tmp+rename. The desktop client spawns `updater.exe` for its
+   in-app "restart to update" flow, so it must always be the freshest build.
+3. **Self-install** — running the binary from anywhere else (e.g. a fresh
+   download from the website) overwrites `<install_dir>/syntee-launcher.exe`
+   with itself and relaunches from there, so a manual re-download upgrades the
+   whole install in one double-click.
 
 ## Build
 

@@ -78,6 +78,22 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Migrate a stale update server (old IP / old domain) to the baked-in
+	// default. launcher.json wins over DefaultUpdateServer, so installs made
+	// before the domain migration would poll the dead IP forever without this.
+	if cfg.UpdateServer != config.DefaultUpdateServer {
+		log.Printf("migrating update_server %q -> %q", cfg.UpdateServer, config.DefaultUpdateServer)
+		cfg.UpdateServer = config.DefaultUpdateServer
+		if err := cfg.Save(); err != nil {
+			log.Printf("save config after update_server migration: %v", err)
+		}
+	}
+
+	// Keep current/updater.exe in sync with this binary on EVERY launch — the
+	// client's quit-and-install spawns updater.exe, so it must be the freshest
+	// launcher build, not whatever happened to apply the last update.
+	syncUpdaterExe(cfg)
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go handleSignals(cancel)
@@ -437,13 +453,8 @@ func copyUpdaterAfterApply(cfg *config.Config) {
 		return
 	}
 	dst := filepath.Join(cfg.CurrentDir(), "updater.exe")
-	data, err := os.ReadFile(exePath)
-	if err != nil {
-		log.Printf("copyUpdater: read: %v", err)
-		return
-	}
-	if err := os.WriteFile(dst, data, 0o755); err != nil {
-		log.Printf("copyUpdater: write: %v", err)
+	if err := copyFileAtomic(exePath, dst); err != nil {
+		log.Printf("copyUpdater: %v", err)
 		return
 	}
 	log.Printf("copyUpdater: copied -> %s", dst)

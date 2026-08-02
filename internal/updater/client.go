@@ -16,7 +16,7 @@ import (
 // swap) lives in apply.go.
 type Client struct {
 	http       *http.Client
-	serverURL  string // e.g. "https://gateway.syntee.dev/api/public/updates"
+	serverURL  string // e.g. "https://syntee.fun/api/public/updates"
 	dlTimeout  time.Duration
 }
 
