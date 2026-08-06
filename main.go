@@ -25,6 +25,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -44,6 +45,16 @@ func main() {
 	defer logSync()
 
 	log.Printf("syntee-launcher starting (pid=%d, args=%v)", os.Getpid(), os.Args[1:])
+
+	// Release any inherited working directory that points inside the install
+	// tree. The client spawns us (current/updater.exe) with cwd inherited
+	// from itself — and the client runs with cwd=current/ (we set cmd.Dir
+	// when launching it). Windows refuses to rename a directory that is any
+	// process's CWD, so as long as we — or the WebView2 helper processes the
+	// GUI spawns later, which inherit our CWD at creation time — sit in
+	// current/, the apply step can never rename it ("being used by another
+	// process"). Chdir to a neutral location BEFORE creating the GUI.
+	chdirToTemp()
 
 	// --uninstall: no GUI, use MessageBox.
 	for _, arg := range os.Args[1:] {
@@ -395,23 +406,113 @@ func launchClientAndCountdown(cfg *config.Config, g *gui.GUI) {
 	g.Terminate()
 }
 
-// killClientIfRunning kills any running instance of the client so the updater
-// can rename/replace files in current/. Uses taskkill /F with CREATE_NO_WINDOW
-// so no console pops up. If the client isn't running, taskkill exits non-zero
-// — we ignore the error. After killing, waits 2s for the OS to release handles.
-func killClientIfRunning(cfg *config.Config) {
-	exeName := cfg.ClientExe
-	cmd := exec.Command("taskkill", "/IM", exeName, "/F")
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		HideWindow:    true,
-		CreationFlags: 0x08000000, // CREATE_NO_WINDOW
-	}
-	if err := cmd.Run(); err != nil {
-		log.Printf("killClient: taskkill %s: %v (ok if not running)", exeName, err)
+// chdirToTemp moves the process working directory to the OS temp dir.
+// See the call site in main for why: an inherited CWD inside current/ makes
+// the apply-time rename of current/ fail with a sharing violation, and the
+// WebView2 children spawned by the GUI inherit our CWD when they are created,
+// so this must happen before gui.New().
+func chdirToTemp() {
+	tmp := os.TempDir()
+	if tmp == "" {
 		return
 	}
-	log.Printf("killClient: killed %s, waiting for handles to release", exeName)
-	time.Sleep(2 * time.Second)
+	if err := os.Chdir(tmp); err != nil {
+		log.Printf("chdir %s: %v (continuing with inherited cwd)", tmp, err)
+		return
+	}
+	log.Printf("chdir -> %s", tmp)
+}
+
+// killClientIfRunning kills every process holding a handle inside current/
+// so the updater can rename/replace the directory. The client exe alone is
+// not enough: the launcher also keeps current/updater.exe around (the client
+// spawns it for quit-and-install), and the client may have spawned helper
+// processes (overlays, IPC, crashpad, etc.) whose image lives in current/.
+// Any of those keeps a handle on current/ and makes os.Rename fail with
+// "The process cannot access the file because it is being used by another
+// process."
+//
+// We enumerate every *.exe in current/ and taskkill /F /T (tree) each by name.
+// /T also kills child processes of a match, which covers helpers spawned by
+// the client. Failures are logged but non-fatal: an exe that isn't running
+// makes taskkill exit non-zero, and we still proceed to the rename.
+//
+// After killing, we wait for the OS to release the directory handle. Windows
+// often keeps the handle for a moment after the process dies, so we retry
+// the rename below with backoff rather than relying on a fixed sleep.
+func killClientIfRunning(cfg *config.Config) {
+	exeNames := runningExeNamesIn(cfg.CurrentDir())
+
+	// Never kill ourselves: in the quit-and-install flow the client spawns
+	// current/updater.exe — i.e. THIS process — and our own image name is in
+	// the list. taskkill /IM kills by name, so it would terminate us
+	// mid-update. Detect that case and drop our own name from the targets.
+	if selfExe, err := os.Executable(); err == nil {
+		if strings.EqualFold(filepath.Dir(selfExe), filepath.Clean(cfg.CurrentDir())) {
+			selfName := filepath.Base(selfExe)
+			filtered := exeNames[:0]
+			for _, n := range exeNames {
+				if !strings.EqualFold(n, selfName) {
+					filtered = append(filtered, n)
+				}
+			}
+			exeNames = filtered
+		}
+	}
+
+	if len(exeNames) == 0 {
+		// Fall back to the configured client name — current/ might not list
+		// it (e.g. the client moved itself out of current/ to run), but a
+		// running instance still holds a handle on current/ via its CWD.
+		exeNames = []string{cfg.ClientExe}
+	}
+
+	anyKilled := false
+	for _, name := range exeNames {
+		cmd := exec.Command("taskkill", "/IM", name, "/F", "/T")
+		cmd.SysProcAttr = &syscall.SysProcAttr{
+			HideWindow:    true,
+			CreationFlags: 0x08000000, // CREATE_NO_WINDOW
+		}
+		if err := cmd.Run(); err != nil {
+			log.Printf("killClient: taskkill %s: %v (ok if not running)", name, err)
+			continue
+		}
+		anyKilled = true
+		log.Printf("killClient: killed %s (tree)", name)
+	}
+
+	if anyKilled {
+		log.Printf("killClient: waiting for handles to release")
+		time.Sleep(2 * time.Second)
+	}
+}
+
+// runningExeNamesIn returns the lowercase *.exe filenames directly inside dir.
+// Used to build the taskkill target list; symlinks and subdirectories are
+// ignored. Returns at most a reasonable cap so a poisoned directory can't
+// make us spawn hundreds of taskkill processes.
+func runningExeNamesIn(dir string) []string {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil
+	}
+	const cap = 64
+	var names []string
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := strings.ToLower(e.Name())
+		if !strings.HasSuffix(name, ".exe") {
+			continue
+		}
+		names = append(names, e.Name())
+		if len(names) >= cap {
+			break
+		}
+	}
+	return names
 }
 
 // doUpdate downloads and applies an update, reporting progress to the GUI.

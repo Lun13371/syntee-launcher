@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -46,7 +47,7 @@ func Apply(zipPath, currentDir, backupsDir, stagingDir, oldVersion string, onPro
 		if err := os.MkdirAll(backupsDir, 0o755); err != nil {
 			return fmt.Errorf("create backups dir: %w", err)
 		}
-		if err := os.Rename(currentDir, backupDir); err != nil {
+		if err := renameWithRetry(currentDir, backupDir, renameBackoffTries); err != nil {
 			return fmt.Errorf("backup current -> %s: %w", backupDir, err)
 		}
 	} else if !os.IsNotExist(err) {
@@ -54,14 +55,13 @@ func Apply(zipPath, currentDir, backupsDir, stagingDir, oldVersion string, onPro
 	}
 
 	// Atomic swap: staging/new -> current.
-	if err := os.Rename(newDir, currentDir); err != nil {
+	if err := renameWithRetry(newDir, currentDir, renameBackoffTries); err != nil {
 		// Try to restore the backup so we don't leave the install without a client.
 		if restoreErr := os.Rename(backupDir, currentDir); restoreErr != nil {
 			return fmt.Errorf("swap failed (%v) AND restore failed (%v) — install is in a bad state", err, restoreErr)
 		}
 		return fmt.Errorf("swap new -> current (restored backup): %w", err)
 	}
-
 	// Clean the staging zip; keep staging/new already gone via the rename.
 	_ = os.Remove(zipPath)
 
@@ -211,4 +211,78 @@ func sanitizeVersion(v string) string {
 		}
 		return r
 	}, v)
+}
+
+// renameBackoffTries is how many times renameWithRetry attempts an os.Rename
+// before giving up. Windows often holds a file/directory handle for several
+// seconds after the owning process dies or after a new executable is written
+// (Windows Defender real-time scan, SmartScreen, file system filter drivers).
+// A single Rename can fail with "The process cannot access the file because
+// it is being used by another process" even though no process is visibly
+// running. A retry loop with backoff absorbs this: Defender typically
+// releases within 5–10 s, so 12 attempts (~20 s total) is enough in practice.
+const renameBackoffTries = 12
+
+// renameWithRetry calls os.Rename, retrying on sharing/access violations.
+// The wait is 200ms initially, growing to 2s; 12 attempts is ~16 s worst case.
+// A non-access error is returned immediately — there's no point retrying,
+// e.g. a missing source.
+func renameWithRetry(src, dst string, tries int) error {
+	const (
+		initial = 200 * time.Millisecond
+		maxWait = 2 * time.Second
+	)
+	var lastErr error
+	wait := initial
+	for i := 0; i < tries; i++ {
+		err := os.Rename(src, dst)
+		if err == nil {
+			if i > 0 {
+				log.Printf("rename: %s -> %s succeeded after %d retries", src, dst, i)
+			}
+			return nil
+		}
+		lastErr = err
+		if !isAccessError(err) {
+			return err
+		}
+		log.Printf("rename: %s -> %s attempt %d failed: %v (retry in %v)", src, dst, i+1, err, wait)
+		time.Sleep(wait)
+		if wait < maxWait {
+			wait *= 2
+		}
+	}
+	return lastErr
+}
+
+// isAccessError reports whether err is a Windows sharing/access violation
+// worth retrying (the OS hasn't released a handle yet). os.Rename returns
+// *os.LinkError (not *os.PathError), so we must check both.
+func isAccessError(err error) bool {
+	if err == nil {
+		return false
+	}
+	// Typed: extract the underlying syscall.Errno. os.Rename returns
+	// *os.LinkError on Windows, not *os.PathError.
+	if le, ok := err.(*os.LinkError); ok {
+		if errno, ok := le.Err.(syscall.Errno); ok {
+			switch uint32(errno) {
+			case 5, 32: // ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION
+				return true
+			}
+		}
+	}
+	if pe, ok := err.(*os.PathError); ok {
+		if errno, ok := pe.Err.(syscall.Errno); ok {
+			switch uint32(errno) {
+			case 5, 32:
+				return true
+			}
+		}
+	}
+	// Fallback: any wrapper that lost the typed errno still surfaces the
+	// canonical Windows message text.
+	s := err.Error()
+	return strings.Contains(s, "being used by another process") ||
+		strings.Contains(s, "Access is denied")
 }
