@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/Lun13371/syntee-launcher/internal/config"
+	"github.com/Lun13371/syntee-launcher/internal/setup"
 )
 
 // syncUpdaterExe copies the running launcher binary into current/updater.exe
@@ -44,24 +45,5 @@ func syncUpdaterExe(cfg *config.Config) {
 	log.Printf("syncUpdater: synced -> %s", dst)
 }
 
-// copyFileAtomic writes src to dst via a temp file + rename so a crash
-// mid-write never leaves a truncated updater.exe behind. Windows Rename
-// fails when dst already exists, so we remove it first and retry.
-func copyFileAtomic(src, dst string) error {
-	data, err := os.ReadFile(src)
-	if err != nil {
-		return err
-	}
-	tmp := dst + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o755); err != nil {
-		return err
-	}
-	if err := os.Rename(tmp, dst); err != nil {
-		_ = os.Remove(dst)
-		if rerr := os.Rename(tmp, dst); rerr != nil {
-			_ = os.Remove(tmp)
-			return rerr
-		}
-	}
-	return nil
-}
+// copyFileAtomic preserves the prior updater on failure and skips identical bytes.
+func copyFileAtomic(src, dst string) error { return setup.CopyFileAtomic(src, dst) }

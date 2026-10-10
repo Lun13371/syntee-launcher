@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/Lun13371/syntee-launcher/internal/config"
+	"github.com/Lun13371/syntee-launcher/internal/updater"
 )
 
 // RestoreIfBad swaps current/ back to the most recent backup when the current
@@ -33,12 +34,12 @@ func RestoreIfBad(cfg *config.Config) (string, error) {
 	}
 	// Move the bad current aside (don't lose it for forensics).
 	badDir := filepath.Join(cfg.BackupsDir(), fmt.Sprintf("bad_%s_%d", sanitize(cfg.CurrentVersion), time.Now().Unix()))
-	if err := os.Rename(cfg.CurrentDir(), badDir); err != nil && !os.IsNotExist(err) {
+	if err := updater.RenameWithRetry(cfg.CurrentDir(), badDir); err != nil && !os.IsNotExist(err) {
 		return "", fmt.Errorf("move bad current aside: %w", err)
 	}
-	if err := os.Rename(backup, cfg.CurrentDir()); err != nil {
+	if err := updater.RenameWithRetry(backup, cfg.CurrentDir()); err != nil {
 		// Try to put the bad one back so we don't end up with nothing.
-		_ = os.Rename(badDir, cfg.CurrentDir())
+		_ = updater.RenameWithRetry(badDir, cfg.CurrentDir())
 		return "", fmt.Errorf("restore backup -> current: %w", err)
 	}
 	cfg.SetCurrentVersion(version)
@@ -66,7 +67,7 @@ func latestBackup(cfg *config.Config) (path string, version string, err error) {
 			continue
 		}
 		name := e.Name()
-		if strings.HasPrefix(name, "bad_") {
+		if strings.HasPrefix(name, "bad_") || !validBackup(filepath.Join(cfg.BackupsDir(), name)) {
 			continue
 		}
 		// name = "<version>_<unix_ts>"
@@ -75,10 +76,22 @@ func latestBackup(cfg *config.Config) (path string, version string, err error) {
 			continue
 		}
 		var ts int64
-		fmt.Sscanf(name[idx+1:], "%d", &ts)
+		if _, err := fmt.Sscanf(name[idx+1:], "%d", &ts); err != nil {
+			continue
+		}
+		if ts < 1000000000000 {
+			ts *= int64(time.Second)
+		}
+		version := name[:idx]
+		if raw, err := os.ReadFile(filepath.Join(cfg.BackupsDir(), name, ".version")); err == nil && strings.TrimSpace(string(raw)) != "" {
+			version = strings.TrimSpace(string(raw))
+		}
+		if cfg.IsBad(version) {
+			continue
+		}
 		cands = append(cands, cand{
 			path:    filepath.Join(cfg.BackupsDir(), name),
-			version: name[:idx],
+			version: version,
 			ts:      ts,
 		})
 	}
@@ -87,6 +100,15 @@ func latestBackup(cfg *config.Config) (path string, version string, err error) {
 	}
 	sort.Slice(cands, func(i, j int) bool { return cands[i].ts > cands[j].ts })
 	return cands[0].path, cands[0].version, nil
+}
+
+func validBackup(path string) bool {
+	exe, err := os.Stat(filepath.Join(path, "Syntee Helper.exe"))
+	if err != nil || !exe.Mode().IsRegular() || exe.Size() == 0 {
+		return false
+	}
+	res, err := os.Stat(filepath.Join(path, "resources", "app.asar"))
+	return err == nil && res.Mode().IsRegular() && res.Size() > 0
 }
 
 func sanitize(v string) string {

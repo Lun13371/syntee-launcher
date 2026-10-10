@@ -2,9 +2,13 @@ package updater
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
+	"strings"
 	"time"
 
 	"github.com/Lun13371/syntee-launcher/internal/config"
@@ -15,9 +19,9 @@ import (
 // the launcher only needs check + download; all the heavy lifting (zip, sha,
 // swap) lives in apply.go.
 type Client struct {
-	http       *http.Client
-	serverURL  string // e.g. "https://syntee.fun/api/public/updates"
-	dlTimeout  time.Duration
+	http      *http.Client
+	serverURL string // e.g. "https://syntee.fun/api/public/updates"
+	dlTimeout time.Duration
 }
 
 // NewClient builds a Client from the launcher config. The check timeout is
@@ -33,7 +37,7 @@ func NewClient(cfg *config.Config) *Client {
 		dlTimeout = time.Duration(cfg.DownloadTimeoutSec) * time.Second
 	}
 	return &Client{
-		http:      &http.Client{Timeout: checkTimeout},
+		http:      updateHTTPClient(checkTimeout),
 		serverURL: cfg.UpdateServer,
 		dlTimeout: dlTimeout,
 	}
@@ -47,8 +51,21 @@ func NewClient(cfg *config.Config) *Client {
 // if current < min_version the gateway sets force=true even when the release
 // itself has force=false. The launcher trusts this rather than re-comparing.
 func (c *Client) Check(ctx context.Context, channel, current string) (*Manifest, error) {
-	url := fmt.Sprintf("%s/check?channel=%s&current=%s", c.serverURL, channel, current)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if !channelPattern.MatchString(channel) {
+		return nil, fmt.Errorf("invalid channel")
+	}
+	if err := validateUpdateURL(c.serverURL); err != nil {
+		return nil, err
+	}
+	endpoint, err := url.Parse(strings.TrimRight(c.serverURL, "/") + "/check")
+	if err != nil {
+		return nil, err
+	}
+	query := endpoint.Query()
+	query.Set("channel", channel)
+	query.Set("current", current)
+	endpoint.RawQuery = query.Encode()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.String(), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -63,8 +80,16 @@ func (c *Client) Check(ctx context.Context, channel, current string) (*Manifest,
 		return nil, nil // up to date
 	case http.StatusOK:
 		var m Manifest
-		if err := decodeJSON(resp.Body, &m); err != nil {
+		dec := json.NewDecoder(io.LimitReader(resp.Body, 1<<20))
+		if err := dec.Decode(&m); err != nil {
 			return nil, fmt.Errorf("decode manifest: %w", err)
+		}
+		var extra any
+		if err := dec.Decode(&extra); err != io.EOF {
+			return nil, fmt.Errorf("manifest has trailing data")
+		}
+		if err := m.Validate(channel); err != nil {
+			return nil, err
 		}
 		return &m, nil
 	default:
@@ -72,18 +97,17 @@ func (c *Client) Check(ctx context.Context, channel, current string) (*Manifest,
 	}
 }
 
-// Download fetches the zip artifact for a specific version to dst. It supports
-// HTTP Range so an interrupted download can resume from where it left off
-// (the launcher writes to staging/update.zip and retries on failure).
+// Download fetches a complete artifact into a writer. Use DownloadToStaging
+// for identity-bound resumable downloads.
 //
 // `onProgress` is called periodically with the total bytes downloaded so far;
 // it may be nil.
 func (c *Client) Download(ctx context.Context, zipURL string, dst io.Writer, onProgress func(downloaded int64)) error {
 	// Use a separate client without the check-timeout; downloads can be slow.
-	dlClient := &http.Client{}
-	if c.dlTimeout > 0 {
-		dlClient.Timeout = c.dlTimeout
+	if err := validateUpdateURL(zipURL); err != nil {
+		return err
 	}
+	dlClient := updateHTTPClient(c.dlTimeout)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, zipURL, nil)
 	if err != nil {
 		return err
@@ -118,6 +142,37 @@ func (c *Client) Download(ctx context.Context, zipURL string, dst io.Writer, onP
 		}
 	}
 	return nil
+}
+
+// updateHTTPClient bounds connection establishment and response headers, while
+// allowing long downloads. Per-read deadlines also bound stalled response bodies.
+func updateHTTPClient(timeout time.Duration) *http.Client {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.TLSHandshakeTimeout = 10 * time.Second
+	transport.ResponseHeaderTimeout = 15 * time.Second
+	transport.DisableCompression = true
+	transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+		conn, err := (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext(ctx, network, address)
+		if err != nil {
+			return nil, err
+		}
+		return &idleReadConn{Conn: conn}, nil
+	}
+	return &http.Client{Transport: transport, Timeout: timeout, CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		if len(via) >= 10 {
+			return fmt.Errorf("too many redirects")
+		}
+		return validateUpdateURL(req.URL.String())
+	}}
+}
+
+type idleReadConn struct{ net.Conn }
+
+func (c *idleReadConn) Read(p []byte) (int, error) {
+	if err := c.SetReadDeadline(time.Now().Add(30 * time.Second)); err != nil {
+		return 0, err
+	}
+	return c.Conn.Read(p)
 }
 
 // IsNewer reports whether `candidate` is strictly newer than `current`.

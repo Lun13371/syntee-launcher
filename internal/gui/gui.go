@@ -4,6 +4,7 @@
 package gui
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -33,9 +34,9 @@ const (
 
 // InstallOptions carries the user's choices from the welcome screen.
 type InstallOptions struct {
-	DesktopShortcut bool `json:"desktopShortcut"`
+	DesktopShortcut   bool `json:"desktopShortcut"`
 	StartMenuShortcut bool `json:"startMenuShortcut"`
-	Autostart        bool `json:"autostart"`
+	Autostart         bool `json:"autostart"`
 }
 
 type Progress struct {
@@ -76,6 +77,7 @@ type GUI struct {
 	lastPush time.Time
 	speed    speedTracker
 
+	closed        atomic.Bool
 	clientRunning atomic.Bool
 	decisionCh    chan bool
 	retryCh       chan struct{}
@@ -83,6 +85,7 @@ type GUI struct {
 	reinstallCh   chan struct{}
 	launchCh      chan struct{}
 	verifyCfg     VerifyConfig
+	cancel        context.CancelFunc
 }
 
 func New() (*GUI, error) {
@@ -92,13 +95,14 @@ func New() (*GUI, error) {
 	)
 
 	w := webview2.NewWithOptions(webview2.WebViewOptions{
-		Debug:     true,
+		Debug:     false,
 		AutoFocus: true,
 		WindowOptions: webview2.WindowOptions{
 			Title:  "Syntee Helper",
 			Width:  winW,
 			Height: winH,
 			Center: true,
+			IconId: 1, // RT_GROUP_ICON generated from assets/favicon.ico.
 		},
 	})
 	if w == nil {
@@ -139,17 +143,42 @@ func New() (*GUI, error) {
 }
 
 func (g *GUI) Run(lifecycle func()) {
+	g.RunContext(context.Background(), func(context.Context) { lifecycle() })
+}
+
+// RunContext cancels interactive waits on window close and waits for mutation
+// work to finish before releasing the installation mutex or exiting.
+func (g *GUI) RunContext(parent context.Context, lifecycle func(context.Context)) {
+	ctx, cancel := context.WithCancel(parent)
+	g.mu.Lock()
+	g.cancel = cancel
+	g.mu.Unlock()
+	defer cancel()
+	done := make(chan struct{})
+	// Signal cancellation must also stop the native message loop.
 	go func() {
+		select {
+		case <-parent.Done():
+			g.Terminate()
+		case <-ctx.Done():
+		}
+	}()
+	go func() {
+		defer close(done)
 		defer func() {
 			if r := recover(); r != nil {
 				log.Printf("lifecycle panic: %v", r)
 			}
-			g.wv.Dispatch(func() { g.wv.Terminate() })
+			if ctx.Err() == nil {
+				g.Terminate()
+			}
 		}()
-		lifecycle()
+		lifecycle(ctx)
 	}()
 	g.wv.Run()
-	// Clean up the temp HTML file after the webview loop exits.
+	g.closed.Store(true)
+	cancel()
+	<-done
 	if g.htmlPath != "" {
 		_ = os.Remove(g.htmlPath)
 	}
@@ -194,7 +223,7 @@ func (g *GUI) SetProgress(done, total int64) {
 		SpeedMBps:    speed,
 	}
 	if speed > 0 && total > done {
-		pr.EtaSec = int(float64(total-done)/1024/1024 / speed)
+		pr.EtaSec = int(float64(total-done) / 1024 / 1024 / speed)
 	}
 	g.state.Progress = pr
 	payload := g.state
@@ -208,24 +237,29 @@ func (g *GUI) ResetSpeed() {
 	g.mu.Unlock()
 }
 
-func (g *GUI) SetClientRunning(v bool) { g.clientRunning.Store(v) }
-func (g *GUI) DecisionCh() chan bool          { return g.decisionCh }
-func (g *GUI) RetryCh() chan struct{}         { return g.retryCh }
-func (g *GUI) InstallCh() chan InstallOptions { return g.installCh }
-func (g *GUI) ReinstallCh() chan struct{}     { return g.reinstallCh }
+func (g *GUI) SetClientRunning(v bool)          { g.clientRunning.Store(v) }
+func (g *GUI) DecisionCh() chan bool            { return g.decisionCh }
+func (g *GUI) RetryCh() chan struct{}           { return g.retryCh }
+func (g *GUI) InstallCh() chan InstallOptions   { return g.installCh }
+func (g *GUI) ReinstallCh() chan struct{}       { return g.reinstallCh }
 func (g *GUI) SetVerifyConfig(cfg VerifyConfig) { g.verifyCfg = cfg }
 func (g *GUI) LaunchCh() chan struct{}          { return g.launchCh }
 
-func (g *GUI) Show() { g.wv.Dispatch(func() { showHwnd(g.hwnd, swShow) }) }
-func (g *GUI) Hide() { g.wv.Dispatch(func() { showHwnd(g.hwnd, swHide) }) }
+func (g *GUI) dispatch(fn func()) {
+	if !g.closed.Load() {
+		g.wv.Dispatch(fn)
+	}
+}
+func (g *GUI) Show() { g.dispatch(func() { showHwnd(g.hwnd, swShow) }) }
+func (g *GUI) Hide() { g.dispatch(func() { showHwnd(g.hwnd, swHide) }) }
 
 func (g *GUI) SetCountdown(sec int) {
 	js := fmt.Sprintf("window.__setCountdown(%d)", sec)
-	g.wv.Dispatch(func() { g.wv.Eval(js) })
+	g.dispatch(func() { g.wv.Eval(js) })
 }
 
 func (g *GUI) Terminate() {
-	g.wv.Dispatch(func() { g.wv.Terminate() })
+	g.dispatch(func() { g.wv.Terminate() })
 }
 
 func (g *GUI) GetCurrentState() State {
@@ -240,7 +274,7 @@ func (g *GUI) push(p *Payload) {
 		return
 	}
 	js := fmt.Sprintf("window.__updateState(%s)", string(data))
-	g.wv.Dispatch(func() { g.wv.Eval(js) })
+	g.dispatch(func() { g.wv.Eval(js) })
 }
 
 func (g *GUI) bindFunctions() {
@@ -250,30 +284,57 @@ func (g *GUI) bindFunctions() {
 		}
 	}
 	bind("updateNow", func() {
-		select { case g.decisionCh <- true: default: }
+		select {
+		case g.decisionCh <- true:
+		default:
+		}
 	})
 	bind("later", func() {
-		select { case g.decisionCh <- false: default: }
+		select {
+		case g.decisionCh <- false:
+		default:
+		}
 	})
 	bind("retry", func() {
-		select { case g.retryCh <- struct{}{}: default: }
+		select {
+		case g.retryCh <- struct{}{}:
+		default:
+		}
 	})
 	bind("startInstall", func(opts InstallOptions) {
-		select { case g.installCh <- opts: default: }
+		select {
+		case g.installCh <- opts:
+		default:
+		}
 	})
 	bind("reinstall", func() {
-		select { case g.reinstallCh <- struct{}{}: default: }
+		select {
+		case g.reinstallCh <- struct{}{}:
+		default:
+		}
 	})
 	bind("launchClient", func() {
-		select { case g.launchCh <- struct{}{}: default: }
+		select {
+		case g.launchCh <- struct{}{}:
+		default:
+		}
 	})
 	bind("verifyIntegrity", func() map[string]interface{} {
 		return g.verifyIntegrity()
 	})
 	bind("closeWindow", func() {
+		g.mu.Lock()
+		cancel := g.cancel
+		g.mu.Unlock()
+		if cancel != nil {
+			cancel()
+		}
 		switch g.GetCurrentState() {
 		case StateUpdateAvailable:
-			select { case g.decisionCh <- false: default: }
+			select {
+			case g.decisionCh <- false:
+			default:
+			}
 			g.wv.Terminate()
 		default:
 			// For all other states (including downloading, extracting,
@@ -303,6 +364,12 @@ type speedSample struct {
 func (s *speedTracker) update(downloaded int64) float64 {
 	now := time.Now()
 	if s.lastTime.IsZero() {
+		s.lastTime = now
+		s.lastBytes = downloaded
+		return 0
+	}
+	if downloaded < s.lastBytes {
+		s.reset()
 		s.lastTime = now
 		s.lastBytes = downloaded
 		return 0

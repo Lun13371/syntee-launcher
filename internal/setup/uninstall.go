@@ -9,9 +9,12 @@ import (
 	"strings"
 	"syscall"
 
+	"context"
 	"github.com/Lun13371/syntee-launcher/internal/config"
+	"github.com/Lun13371/syntee-launcher/internal/runner"
 	"github.com/Lun13371/syntee-launcher/internal/ui"
 	"golang.org/x/sys/windows/registry"
+	"time"
 )
 
 // Uninstall removes every trace of Syntee Helper from the system:
@@ -35,6 +38,10 @@ func Uninstall(cfg *config.Config, quiet bool) {
 	}
 
 	log.Printf("uninstall: starting")
+	if err := runner.StopProcessesIn(context.Background(), cfg.CurrentDir(), 2*time.Second); err != nil {
+		log.Printf("uninstall: stop client: %v", err)
+		return
+	}
 
 	// 1. Remove shortcuts.
 	removeShortcuts()
@@ -58,6 +65,9 @@ func Uninstall(cfg *config.Config, quiet bool) {
 		filepath.Join(cfg.Dir(), "launcher.json"),
 		filepath.Join(cfg.Dir(), "syntee-launcher.log"),
 		filepath.Join(cfg.Dir(), ".setup_done"),
+		filepath.Join(cfg.Dir(), "install-options.json"),
+		filepath.Join(cfg.Dir(), "syntee-launcher.log.1"),
+		filepath.Join(cfg.Dir(), "syntee-launcher.log.2"),
 	}
 	for _, d := range dirsToRemove {
 		if err := os.RemoveAll(d); err != nil {

@@ -60,9 +60,10 @@ html,body{
 .logo-badge{
   width:56px;height:56px;
   display:flex;align-items:center;justify-content:center;
-  filter:drop-shadow(0 0 16px rgba(139,92,246,0.35));
+  filter:drop-shadow(0 0 16px rgba(49,95,203,0.35));
   animation:breathe 3s ease-in-out infinite;
 }
+.logo-badge img{display:block;object-fit:contain}
 .spinner{
   width:28px;height:28px;
   border:2.5px solid var(--overlay-4);

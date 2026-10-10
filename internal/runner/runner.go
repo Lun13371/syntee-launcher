@@ -35,7 +35,7 @@ func Run(ctx context.Context, cfg *config.Config) error {
 		return fmt.Errorf("write crash marker: %w", err)
 	}
 
-	cmd := exec.CommandContext(ctx, exe)
+	cmd := exec.Command(exe)
 	cmd.Dir = cfg.CurrentDir()
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -48,10 +48,14 @@ func Run(ctx context.Context, cfg *config.Config) error {
 		return fmt.Errorf("start client: %w", err)
 	}
 
-	if err := cmd.Wait(); err != nil {
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case err := <-done:
 		return err
 	}
-	return nil
 }
 
 // ReachedReady reports whether the client deleted its crash-marker during the
@@ -124,13 +128,4 @@ func StopClient(cfg *config.Config, pid int, timeout time.Duration) error {
 		time.Sleep(200 * time.Millisecond)
 	}
 	return proc.Kill()
-}
-
-func processAlive(pid int) bool {
-	proc, err := os.FindProcess(pid)
-	if err != nil {
-		return false
-	}
-	// On Windows, Signal(0) returns nil if the process exists.
-	return proc.Signal(os.Signal(nil)) == nil
 }

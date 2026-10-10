@@ -33,16 +33,29 @@ type InstallOptions struct {
 // Uses default options (all features enabled). Kept for backward compat.
 func RunIfNeeded(ctx context.Context, cfg *config.Config, client *updater.Client,
 	onProgress func(done, total int64), onPhase func(phase string)) error {
-	return RunIfNeededWithOptions(ctx, cfg, client, InstallOptions{
-		DesktopShortcut:   true,
-		StartMenuShortcut: true,
-		Autostart:         true,
-	}, onProgress, onPhase)
+	opts := InstallOptions{DesktopShortcut: true, StartMenuShortcut: true, Autostart: true}
+	if clientInstalled(cfg) || preferenceFileExists(filepath.Join(cfg.Dir(), "install-options.json")) {
+		var err error
+		opts, err = LoadInstallOptions(cfg)
+		if err != nil {
+			return err
+		}
+	}
+	return RunIfNeededWithOptions(ctx, cfg, client, opts, onProgress, onPhase)
 }
 
 // RunIfNeededWithOptions performs first-run setup with user-selected options.
 func RunIfNeededWithOptions(ctx context.Context, cfg *config.Config, client *updater.Client,
 	opts InstallOptions, onProgress func(done, total int64), onPhase func(phase string)) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := RecoverInstallation(cfg); err != nil {
+		return err
+	}
+	if err := SaveInstallOptions(cfg, opts); err != nil {
+		return fmt.Errorf("save install options: %w", err)
+	}
 	needsClient := !clientInstalled(cfg)
 	// If we're downloading a fresh client, always (re)create shortcuts
 	// — even if old registry keys exist from a previous install.
@@ -67,6 +80,9 @@ func RunIfNeededWithOptions(ctx context.Context, cfg *config.Config, client *upd
 			return fmt.Errorf("no active release on channel %q — cannot install", cfg.Channel)
 		}
 
+		if err := ValidateRelease(cfg, manifest); err != nil {
+			return err
+		}
 		res, err := client.DownloadToStaging(ctx, manifest, cfg.StagingDir(), onProgress)
 		if err != nil {
 			return fmt.Errorf("download client: %w", err)
@@ -76,7 +92,10 @@ func RunIfNeededWithOptions(ctx context.Context, cfg *config.Config, client *upd
 		if onPhase != nil {
 			onPhase("extract")
 		}
-		if err := updater.Apply(res.Path, cfg.CurrentDir(), cfg.BackupsDir(), cfg.StagingDir(), cfg.CurrentVersion, onProgress); err != nil {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := updater.ApplyVersion(res.Path, cfg.CurrentDir(), cfg.BackupsDir(), cfg.StagingDir(), cfg.CurrentVersion, manifest.Version, onProgress); err != nil {
 			return fmt.Errorf("extract client: %w", err)
 		}
 
@@ -121,16 +140,7 @@ func copyUpdater(cfg *config.Config) {
 	log.Printf("copyUpdater: copied -> %s", dst)
 }
 
-func copyFile(src, dst string) error {
-	data, err := os.ReadFile(src)
-	if err != nil {
-		return fmt.Errorf("read %s: %w", src, err)
-	}
-	if err := os.WriteFile(dst, data, 0o755); err != nil {
-		return fmt.Errorf("write %s: %w", dst, err)
-	}
-	return nil
-}
+func copyFile(src, dst string) error { return CopyFileAtomic(src, dst) }
 
 // clientInstalled returns true if current/<client_exe> exists and is non-empty.
 func clientInstalled(cfg *config.Config) bool {
@@ -164,13 +174,13 @@ func markSetupDone(cfg *config.Config) {
 // even after upgrading from an older launcher that pointed them at
 // the launcher binary.
 func EnsureShortcuts(cfg *config.Config) error {
-	log.Printf("ensuring shortcuts point to client exe")
+	opts, err := LoadInstallOptions(cfg)
+	if err != nil {
+		return err
+	}
+	log.Printf("ensuring selected shortcuts point to client exe")
 	removeOldShortcuts()
-	return registerApp(cfg, InstallOptions{
-		DesktopShortcut:   true,
-		StartMenuShortcut: true,
-		Autostart:         true,
-	})
+	return registerApp(cfg, opts)
 }
 
 // removeOldShortcuts deletes existing shortcuts so they can be recreated
@@ -193,10 +203,9 @@ func removeOldShortcuts() {
 // pointing them at the client exe (not the launcher). Called after reinstall
 // or when shortcuts are stale.
 func RecreateShortcuts(cfg *config.Config) error {
-	opts := InstallOptions{
-		DesktopShortcut:   true,
-		StartMenuShortcut: true,
-		Autostart:         true,
+	opts, err := LoadInstallOptions(cfg)
+	if err != nil {
+		return err
 	}
 
 	// Remove old shortcuts first.
@@ -206,8 +215,8 @@ func RecreateShortcuts(cfg *config.Config) error {
 	_ = os.Remove(desktopLnk)
 
 	// Remove old autostart pointing to launcher.
-	k, err := registry.OpenKey(registry.CURRENT_USER, autostartRegPath, registry.SET_VALUE)
-	if err == nil {
+	k, openErr := registry.OpenKey(registry.CURRENT_USER, autostartRegPath, registry.SET_VALUE)
+	if openErr == nil {
 		_ = k.DeleteValue("SynteeHelper")
 		k.Close()
 	}
@@ -218,8 +227,8 @@ func RecreateShortcuts(cfg *config.Config) error {
 // ── registerApp: shortcuts + autostart + uninstall registry ───────────────
 
 const (
-	appName      = "Syntee Helper"
-	appPublisher = "Syntee"
+	appName          = "Syntee Helper"
+	appPublisher     = "Syntee"
 	uninstallRegPath = `Software\Microsoft\Windows\CurrentVersion\Uninstall\SynteeHelper`
 	autostartRegPath = `Software\Microsoft\Windows\CurrentVersion\Run`
 )
@@ -232,7 +241,7 @@ func registerApp(cfg *config.Config, opts InstallOptions) error {
 	if opts.StartMenuShortcut {
 		if err := createShortcut(
 			filepath.Join(os.Getenv("APPDATA"), "Microsoft", "Windows", "Start Menu", "Programs", "Syntee Helper.lnk"),
-			clientPath, clientPath,
+			clientPath, launcherPath,
 		); err != nil {
 			log.Printf("start menu shortcut: %v", err)
 		}
@@ -241,7 +250,7 @@ func registerApp(cfg *config.Config, opts InstallOptions) error {
 		if desktop := os.Getenv("USERPROFILE"); desktop != "" {
 			if err := createShortcut(
 				filepath.Join(desktop, "Desktop", "Syntee Helper.lnk"),
-				clientPath, clientPath,
+				clientPath, launcherPath,
 			); err != nil {
 				log.Printf("desktop shortcut: %v", err)
 			}
@@ -256,7 +265,7 @@ func registerApp(cfg *config.Config, opts InstallOptions) error {
 	}
 
 	// Uninstall entry in "Programs and Features" (always created, points to launcher).
-	if err := registerUninstall(cfg, launcherPath, clientPath); err != nil {
+	if err := registerUninstall(cfg, launcherPath, launcherPath); err != nil {
 		log.Printf("uninstall registry: %v", err)
 	}
 
@@ -264,7 +273,8 @@ func registerApp(cfg *config.Config, opts InstallOptions) error {
 }
 
 // createShortcut creates a Windows .lnk file pointing at target, using the
-// client exe as the icon. We shell out to PowerShell because Go has no native
+// launcher exe as the brand icon. The target remains the client exe.
+// We shell out to PowerShell because Go has no native
 // .lnk support and pulling in a COM binding for one call is overkill.
 func createShortcut(lnkPath, targetPath, iconPath string) error {
 	_ = os.MkdirAll(filepath.Dir(lnkPath), 0o755)
@@ -304,12 +314,12 @@ func registerUninstall(cfg *config.Config, launcherPath, iconPath string) error 
 	installLocation := cfg.Dir()
 
 	entries := map[string]string{
-		"DisplayName":     appName,
-		"DisplayVersion":  cfg.CurrentVersion,
-		"Publisher":       appPublisher,
-		"InstallLocation": installLocation,
-		"DisplayIcon":     iconPath + ",0",
-		"UninstallString": uninstallCmd,
+		"DisplayName":          appName,
+		"DisplayVersion":       cfg.CurrentVersion,
+		"Publisher":            appPublisher,
+		"InstallLocation":      installLocation,
+		"DisplayIcon":          iconPath + ",0",
+		"UninstallString":      uninstallCmd,
 		"QuietUninstallString": uninstallCmd + " --quiet",
 	}
 	for name, value := range entries {

@@ -2,24 +2,26 @@
 
 Bootstrap updater for the SynteeHelper desktop client (Windows).
 
-`syntee-launcher.exe` is the single entry point of a SynteeHelper install:
-shortcuts, the Start Menu, and the `HKCU\...\Run` autostart key all point at
-this binary, **never** at `Syntee Helper.exe`. On every launch it:
+`syntee-launcher.exe` installs, updates and repairs SynteeHelper. Desktop,
+Start Menu and autostart entries launch `current/Syntee Helper.exe` directly;
+the client can invoke `current/updater.exe` for its restart-to-update flow.
+The launcher is not a permanent supervisor of directly launched clients.
 
-1. **Crash-loop recovery** — if the current version is in `bad_versions`,
-   restores the most recent backup before doing anything else.
-2. **Check** — asks the Syntee-Gateway whether a newer build exists for the
-   configured channel. Offline-first: a failed check never blocks launch.
-3. **Apply** — downloads the zip (with HTTP Range resume), verifies SHA256,
-   backs up `current/` → `backups/<old>/`, atomically swaps the new build in.
-   - `force=true` (or `current < min_version`) → **blocking**: a MessageBox
-     shows progress, the update is applied before the client starts.
-   - `force=false` → **background**: the zip is staged in `staging/` and
-     applied on the next launch (after `app.quit()` from the in-app updater).
-4. **Run** — spawns `current/Syntee Helper.exe`, waits for it to exit, loops.
-   A crash-marker (`.crash_marker`) written before spawn and deleted by the
-   client on ready-state lets the launcher detect crashes and, after 3
-   consecutive crash-loops, restore the backup and mark the version bad.
+Its lifecycle is:
+
+1. Recover interrupted installation transactions and reconcile installed
+   version metadata before checking for updates.
+2. Check the gateway for a newer build. A failed check leaves the installed
+   client available; known-bad releases must not be automatically reinstalled.
+3. Download with persistent partial-file resume, verify size and SHA256,
+   validate/extract into staging, back up the old client, then promote the new
+   directory. GUI updates are applied immediately after user acceptance;
+   forced updates do not require a decision. Headless mode applies forced
+   updates only.
+4. Launch the client independently of launcher lifetime. Startup monitoring
+   can detect observed early failures, but complete crash-loop detection on
+   direct shortcut launches requires client-side integration. Missing ready
+   markers alone are not proof that a running client crashed.
 
 ## Install layout
 
@@ -34,8 +36,10 @@ this binary, **never** at `Syntee Helper.exe`. On every launch it:
 ├── backups/                     ← previous versions (for rollback)
 │   └── 0.1.0_<unix_ts>/
 └── staging/                     ← scratch: download + unzip before atomic swap
-    ├── update.zip
-    └── update.json              ← cached manifest (so apply knows the version)
+    ├── update.zip.part          ← persistent incomplete download
+    ├── update.zip.part.json     ← artifact identity and resume validators
+    ├── update.zip               ← fully verified archive only
+    └── apply.json               ← interrupted directory-swap recovery journal
 ```
 
 ## `launcher.json`
@@ -68,9 +72,10 @@ Every launch (before any update check) the launcher repairs its own install:
    builds), it is forcibly rewritten to the baked default and saved. The JSON
    wins over the baked default, so without this old installs would poll a dead
    server forever.
-2. **`current/updater.exe` sync** — the running binary copies itself to
+2. **`current/updater.exe` sync** — the running binary checks itself against
    `current/updater.exe` on every launch (not only after applying an update),
-   atomically via tmp+rename. The desktop client spawns `updater.exe` for its
+   replacing it only if different via flushed temporary file and Windows
+   replace/write-through semantics. The desktop client spawns `updater.exe` for its
    in-app "restart to update" flow, so it must always be the freshest build.
 3. **Self-install** — running the binary from anywhere else (e.g. a fresh
    download from the website) overwrites `<install_dir>/syntee-launcher.exe`
@@ -80,16 +85,40 @@ Every launch (before any update check) the launcher repairs its own install:
 ## Build
 
 ```bash
-GOOS=windows GOARCH=amd64 go build -ldflags="-s -w -H windowsgui" -o syntee-launcher.exe .
+GOOS=windows GOARCH=amd64 go build -ldflags="-s -w -H windowsgui -X github.com/Lun13371/syntee-launcher/internal/config.DefaultUpdateServer=https://syntee.fun/api/public/updates" -o syntee-launcher.exe .
 ```
 
-`-H windowsgui` suppresses the console window (the launcher is a GUI-less
-background process; user-facing messages go through `MessageBox`).
+`-H windowsgui` suppresses the console window. Installation and update screens
+use WebView2; fallback errors use `MessageBox`.
+
+### Brand assets / Windows icon
+
+The canonical ribbon S assets live in `internal/gui/assets/`: `logo.svg`,
+`logo.png` (raster source), and `favicon.ico`, copied from Syntee-Gateway's
+`frontend-user/public`. The UI embeds SVG and favicon data URIs so it works
+from its temporary HTML file without network access. The launcher currently
+has a fixed dark theme; its logo animation and layout are preserved.
+
+`syntee-launcher.syso` is the checked-in Windows resource (amd64, icon group 1),
+used by the exe/installer and its window. Shortcuts still launch the client,
+but their icon and the uninstall entry's icon come from the launcher.
+After changing `favicon.ico`, regenerate the resource before building:
+
+```powershell
+go run github.com/akavel/rsrc@v0.10.2 -arch amd64 -ico internal/gui/assets/favicon.ico -o syntee-launcher.syso
+go build -ldflags="-s -w -H windowsgui" -o syntee-launcher.exe .
+```
+
+Direct builds only write the local executable. `dev.bat` / `prod.bat` also
+copy it into SynteeHelper and Syntee-Gateway and modify local install config.
 
 ## Gateway endpoints
 
-The launcher talks to three public endpoints on Syntee-Gateway (no auth —
-integrity is guaranteed by SHA256 in the manifest):
+The launcher talks to public endpoints on Syntee-Gateway. Production builds
+use HTTPS. SHA256 verifies download integrity against the manifest; it does
+**not** authenticate the release publisher if the manifest is compromised.
+Signed releases require a gateway signing pipeline and a trusted public key;
+no synthetic keys or fake signature verification are used.
 
 - `GET /api/public/updates/check?channel=stable&current=X.Y.Z` — 204 (up to
   date) or 200 with a `ReleaseManifest` JSON body.
@@ -100,15 +129,10 @@ integrity is guaranteed by SHA256 in the manifest):
 
 ## Testing
 
-The launcher is end-to-end testable against a running gateway with a fake
-client binary — see the test plan in the parent project's planning docs. Key
-scenarios covered:
+Run `go test ./...` and `go vet ./...` on Windows. CI runs tests and vet before
+building the HTTPS production artifact.
 
-| Scenario | Expected behaviour |
-|---|---|
-| No active release on server | 204, launch current client |
-| Non-force update available | Background-download + apply on next launch |
-| Force update available | Blocking download with MessageBox + apply before launch |
-| Client crashes 3× in a row | Restore latest backup, mark version bad |
-| Bad version with no backup | Fatal MessageBox: "please reinstall manually" |
-| Server unreachable | Launch current client (offline-first) |
+See [STABILITY_TEST_PLAN.md](STABILITY_TEST_PLAN.md) for manual fault-injection
+acceptance tests. Tests with simulated HTTP servers or filesystem fixtures do
+not replace real Windows checks with Defender, WebView2 and the shipped client.
+Never run destructive fault-injection tests against a working installation.

@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 
 	"github.com/Lun13371/syntee-launcher/internal/config"
+	"github.com/Lun13371/syntee-launcher/internal/setup"
 )
 
 // selfInstall copies the launcher binary into the install directory
@@ -77,14 +78,7 @@ func selfInstall() bool {
 }
 
 func copySelf(src, dst string) error {
-	data, err := os.ReadFile(src)
-	if err != nil {
-		return fmt.Errorf("read self: %w", err)
-	}
-	if err := os.WriteFile(dst, data, 0o755); err != nil {
-		return fmt.Errorf("write %s: %w", dst, err)
-	}
-	return nil
+	return setup.CopyFileAtomic(src, dst)
 }
 
 // relaunchFromInstall starts a new copy of the launcher from the install dir
@@ -94,12 +88,12 @@ func relaunchFromInstall(installedPath string) bool {
 	attr := &os.ProcAttr{
 		Files: []*os.File{nil, nil, nil},
 	}
-	proc, err := os.StartProcess(installedPath, []string{installedPath}, attr)
+	proc, err := os.StartProcess(installedPath, append([]string{installedPath}, os.Args[1:]...), attr)
 	if err != nil {
 		log.Printf("self-install: relaunch failed: %v", err)
 		return false
 	}
 	log.Printf("self-install: relaunched from %s (pid=%d), exiting temp copy", installedPath, proc.Pid)
-	os.Exit(0)
-	return true // unreachable, but keeps the compiler happy
+	_ = proc.Release()
+	return true // main returns and releases mutex before child proceeds
 }

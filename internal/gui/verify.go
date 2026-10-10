@@ -57,7 +57,7 @@ func (g *GUI) verifyIntegrity() map[string]interface{} {
 
 	return map[string]interface{}{
 		"ok":      true,
-		"message": "Все файлы на месте. Целостность подтверждена.\nФайлов в current/: " + intToStr(len(entries)),
+		"message": "Основные файлы присутствуют и не пусты. Контрольные суммы не проверялись.\nФайлов в current/: " + intToStr(len(entries)),
 	}
 }
 

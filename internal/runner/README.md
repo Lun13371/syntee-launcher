@@ -1,0 +1,9 @@
+# Startup monitoring and direct shortcuts
+
+Windows shortcuts and autostart intentionally target `current/Syntee Helper.exe`, not the launcher. The launcher monitors only client starts that it performs after installation/update or from its management UI.
+
+Before starting a client it removes the stale ready marker and writes `.crash_marker`. The client must write the configured ready marker (normally `.ready`) or delete `.crash_marker` after successful initialization. The launcher resets the crash count on ready; an exit or spawn failure before ready increments the count. At the configured threshold it marks the version bad and restores a backup, after stopping remaining in-tree helpers. A 60-second readiness timeout is not proof of a crash: the client is left running. Cancellation/window close also leaves the detached client running.
+
+Full crash-loop detection for starts through direct shortcuts requires client cooperation: the client must maintain startup markers/counters and invoke the updater/recovery entry point after repeated failures. Interrupted launcher monitoring also requires startup recovery to reconcile stale markers without counting a still-running client as crashed. Apply-journal recovery must run under the installation mutex before directory-dependent operations.
+
+`ProcessesIn` uses Toolhelp process enumeration and `QueryFullProcessImageName`; only executable paths beneath the installation's current directory are selected and the launcher PID is excluded. `StopProcessesIn` first offers the optional `.launcher_quit` protocol, then validates and terminates each selected process through a Windows handle. It deliberately does not use `taskkill /IM` or unrestricted `/T`: the updater itself can be a descendant of the client. In-tree helper processes are individually included; processes outside the installation are not killed. A client that does not watch `.launcher_quit` is force-terminated after the grace period.

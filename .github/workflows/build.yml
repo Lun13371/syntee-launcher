@@ -21,6 +21,9 @@ jobs:
       - name: Download dependencies
         run: go mod download
 
+      - name: Test
+        run: go test ./...
+
       - name: Vet
         run: go vet ./...
 
@@ -28,7 +31,7 @@ jobs:
         env:
           GOOS: windows
           GOARCH: amd64
-        run: go build -ldflags="-s -w -H windowsgui" -o syntee-launcher.exe .
+        run: go build -ldflags="-s -w -H windowsgui -X github.com/Lun13371/syntee-launcher/internal/config.DefaultUpdateServer=https://syntee.fun/api/public/updates" -o syntee-launcher.exe .
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

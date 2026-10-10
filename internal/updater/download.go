@@ -4,211 +4,330 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"log"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strconv"
+	"strings"
 	"time"
+
+	"github.com/Lun13371/syntee-launcher/internal/config"
 )
 
-// DownloadResult is what DownloadToStaging returns on success.
 type DownloadResult struct {
-	Path     string // absolute path to the saved zip
+	Path     string
 	Size     int64
-	SHA256   string // hex-encoded, verified against manifest
+	SHA256   string
 	Duration time.Duration
 }
 
-// DownloadToStaging fetches the release zip into <staging>/update.zip,
-// computing SHA256 as bytes arrive. If a partial staging file already exists
-// and the server honours Range, the download resumes from the byte count we
-// already have — this is how the launcher survives flaky connections without
-// re-downloading 150MB every time.
-//
-// The function is idempotent: if the full file is already present and its
-// SHA256 matches, it returns immediately (useful for the "download in
-// background, apply later" non-force flow).
-func (c *Client) DownloadToStaging(ctx context.Context, m *Manifest, stagingDir string, onProgress func(downloaded int64, total int64)) (*DownloadResult, error) {
-	if err := os.MkdirAll(stagingDir, 0o755); err != nil {
-		return nil, fmt.Errorf("create staging dir: %w", err)
-	}
-	dest := filepath.Join(stagingDir, "update.zip")
-
-	// Fast path: already downloaded and verified.
-	if info, err := os.Stat(dest); err == nil && info.Size() == m.ZipSize {
-		sum, err := fileSHA256(dest)
-		if err == nil && sum == m.SHA256 {
-			return &DownloadResult{Path: dest, Size: info.Size(), SHA256: sum, Duration: 0}, nil
-		}
-	}
-
-	// Try up to 2 attempts: first with resume, then fresh (delete + retry).
-	for attempt := 0; attempt < 2; attempt++ {
-		if attempt > 0 {
-			// Second attempt: delete any corrupt partial file and start fresh.
-			_ = os.Remove(dest)
-		}
-		res, err := c.downloadOnce(ctx, m, dest, onProgress, attempt == 0)
-		if err == nil {
-			return res, nil
-		}
-		// On size/hash mismatch, retry. On other errors (network), also retry once.
-		if attempt == 0 {
-			// Log and retry — the second attempt will delete the file.
-			continue
-		}
-		return nil, err
-	}
-	return nil, fmt.Errorf("download failed after retry")
+// Partial bytes are usable only alongside metadata matching all artifact fields.
+type downloadIdentity struct {
+	URL          string `json:"url"`
+	Version      string `json:"version"`
+	Size         int64  `json:"size"`
+	Hash         string `json:"sha256"`
+	ETag         string `json:"etag,omitempty"`
+	LastModified string `json:"last_modified,omitempty"`
 }
 
-// downloadOnce performs a single download attempt. If resume is true and a
-// partial file exists, it tries to resume via HTTP Range.
-func (c *Client) downloadOnce(ctx context.Context, m *Manifest, dest string, onProgress func(downloaded int64, total int64), resume bool) (*DownloadResult, error) {
-	// Open destination: O_RDWR because we need to read back the existing
-	// prefix for SHA256 verification on resume.
-	f, err := os.OpenFile(dest, os.O_CREATE|os.O_RDWR, 0o644)
+func saveDownloadIdentity(path string, id *downloadIdentity) error {
+	b, err := json.Marshal(id)
 	if err != nil {
-		return nil, fmt.Errorf("open staging file: %w", err)
+		return err
 	}
-	defer f.Close()
-
-	existing, err := f.Seek(0, io.SeekEnd)
-	if err != nil {
-		return nil, fmt.Errorf("seek staging file: %w", err)
+	return config.AtomicWriteFile(path, b, 0o600)
+}
+func removeDownloadFile(path string) error {
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return err
 	}
+	return nil
+}
 
-	// If we already have the full size (or more — corrupt), restart fresh.
-	if existing >= m.ZipSize {
-		if err := f.Truncate(0); err != nil {
-			return nil, fmt.Errorf("truncate staging file: %w", err)
-		}
-		if _, err := f.Seek(0, io.SeekStart); err != nil {
-			return nil, fmt.Errorf("rewind staging file: %w", err)
-		}
-		existing = 0
-	}
-
-	// If not resuming (second attempt), always start from scratch.
-	if !resume && existing > 0 {
-		if err := f.Truncate(0); err != nil {
-			return nil, fmt.Errorf("truncate staging file: %w", err)
-		}
-		if _, err := f.Seek(0, io.SeekStart); err != nil {
-			return nil, fmt.Errorf("rewind staging file: %w", err)
-		}
-		existing = 0
-	}
-
-	// Build the request. Add Range header only when resuming a partial file.
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, m.ZipURL, nil)
-	if err != nil {
+// DownloadToStaging retains identity-bound .part files on interruption. Only
+// size- and hash-verified complete bytes are published as update.zip. Calls for
+// a given staging directory must be serialized by the caller.
+func (c *Client) DownloadToStaging(ctx context.Context, m *Manifest, stagingDir string, progress func(int64, int64)) (*DownloadResult, error) {
+	if err := m.Validate(); err != nil {
 		return nil, err
 	}
-	if existing > 0 {
-		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", existing))
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
+	if err := os.MkdirAll(stagingDir, 0o755); err != nil {
+		return nil, err
+	}
+	start := time.Now()
+	dest := filepath.Join(stagingDir, "update.zip")
+	part, meta := dest+".part", dest+".part.json"
+	hash := strings.ToLower(m.SHA256)
+	// Legacy update.zip files are accepted only after full verification. Never
+	// treat an unverified legacy zip as a resumable prefix.
+	if info, err := os.Stat(dest); err == nil {
+		if !info.Mode().IsRegular() {
+			return nil, fmt.Errorf("staged zip is not a regular file")
+		}
+		if info.Size() == m.ZipSize {
+			sum, err := fileSHA256(dest)
+			if err != nil {
+				return nil, err
+			}
+			if sum == hash {
+				return &DownloadResult{Path: dest, Size: m.ZipSize, SHA256: sum}, nil
+			}
+		}
+		if err := removeDownloadFile(dest); err != nil {
+			return nil, err
+		}
+	} else if !os.IsNotExist(err) {
+		return nil, err
+	}
+	id := downloadIdentity{URL: m.ZipURL, Version: m.Version, Size: m.ZipSize, Hash: hash}
+	var old downloadIdentity
+	b, err := os.ReadFile(meta)
+	if err != nil && !os.IsNotExist(err) {
+		return nil, err
+	}
+	if err == nil && json.Unmarshal(b, &old) == nil && old.URL == id.URL && old.Version == id.Version && old.Size == id.Size && old.Hash == id.Hash {
+		id = old
+	} else {
+		if err := removeDownloadFile(part); err != nil {
+			return nil, err
+		}
+		if err := saveDownloadIdentity(meta, &id); err != nil {
+			return nil, err
+		}
+	}
+	dlClient := updateHTTPClient(c.dlTimeout)
+	defer dlClient.CloseIdleConnections()
+	const maxAttempts = 6
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		retry, err := c.downloadPart(ctx, dlClient, m, part, meta, &id, progress)
+		if err == nil {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			if err := os.Rename(part, dest); err != nil {
+				return nil, fmt.Errorf("publish zip: %w", err)
+			}
+			// Metadata is no longer needed. Publication succeeded even if cleanup fails.
+			_ = os.Remove(meta)
+			return &DownloadResult{Path: dest, Size: m.ZipSize, SHA256: hash, Duration: time.Since(start)}, nil
+		}
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		if !retry || attempt == maxAttempts-1 {
+			return nil, err
+		}
+		wait := time.Duration(1<<attempt)*200*time.Millisecond + time.Duration(time.Now().UnixNano()%100)*time.Millisecond
+		log.Printf("download interrupted: %v; resume retry %d/%d in %s", err, attempt+2, maxAttempts, wait)
+		timer := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
+	}
+	return nil, fmt.Errorf("download retries exhausted")
+}
 
-	dlClient := &http.Client{}
-	if c.dlTimeout > 0 {
-		dlClient.Timeout = c.dlTimeout
+var contentRangePattern = regexp.MustCompile(`^bytes ([0-9]+)-([0-9]+)/([0-9]+)$`)
+
+func validDownloadRange(value string, offset, total int64) bool {
+	match := contentRangePattern.FindStringSubmatch(value)
+	if match == nil {
+		return false
 	}
-	resp, err := dlClient.Do(req)
+	values := make([]int64, 3)
+	for i := range values {
+		n, err := strconv.ParseInt(match[i+1], 10, 64)
+		if err != nil {
+			return false
+		}
+		values[i] = n
+	}
+	return values[0] == offset && values[1] == total-1 && values[2] == total
+}
+
+// retry is true only for transient network/server errors, never disk errors.
+func (c *Client) downloadPart(ctx context.Context, client *http.Client, m *Manifest, part, meta string, id *downloadIdentity, progress func(int64, int64)) (retry bool, err error) {
+	f, err := os.OpenFile(part, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
-		return nil, fmt.Errorf("download request: %w", err)
+		return false, err
+	}
+	defer func() {
+		if closeErr := f.Close(); closeErr != nil {
+			retry = false
+			err = closeErr
+		}
+	}()
+	info, err := f.Stat()
+	if err != nil {
+		return false, err
+	}
+	if !info.Mode().IsRegular() {
+		return false, fmt.Errorf("partial is not a regular file")
+	}
+	offset := info.Size()
+	if offset > m.ZipSize {
+		if err := f.Truncate(0); err != nil {
+			return false, err
+		}
+		offset = 0
+	}
+	if offset == m.ZipSize {
+		return verifyDownloadPart(f, m, part)
+	}
+	if _, err := f.Seek(offset, io.SeekStart); err != nil {
+		return false, err
+	}
+	if offset > 0 {
+		log.Printf("resuming download: %d / %d bytes", offset, m.ZipSize)
+	}
+	if progress != nil {
+		progress(offset, m.ZipSize)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, m.ZipURL, nil)
+	if err != nil {
+		return false, err
+	}
+	req.Header.Set("Accept-Encoding", "identity")
+	if offset > 0 {
+		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", offset))
+		if id.ETag != "" {
+			req.Header.Set("If-Range", id.ETag)
+		} else if id.LastModified != "" {
+			req.Header.Set("If-Range", id.LastModified)
+		}
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		var networkError net.Error
+		transient := errors.As(err, &networkError) && (networkError.Timeout() || networkError.Temporary())
+		// Connection resets and premature EOF also occur before response headers.
+		var operationError *net.OpError
+		transient = transient || errors.As(err, &operationError) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)
+		return transient, fmt.Errorf("download request: %w", err)
 	}
 	defer resp.Body.Close()
-
-	// 200 = full body (server ignored Range or nothing was resumable); rewind.
-	// 206 = partial content, server accepted our Range — continue appending.
-	switch resp.StatusCode {
-	case http.StatusOK:
-		if existing > 0 {
-			if err := f.Truncate(0); err != nil {
-				return nil, fmt.Errorf("truncate on 200: %w", err)
-			}
-			if _, err := f.Seek(0, io.SeekStart); err != nil {
-				return nil, fmt.Errorf("rewind on 200: %w", err)
-			}
-			existing = 0
-		}
-	case http.StatusPartialContent:
-		// Append from `existing`.
-	default:
-		return nil, fmt.Errorf("download returned status %d", resp.StatusCode)
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
+		return resp.StatusCode == 408 || resp.StatusCode == 429 || resp.StatusCode == 500 || resp.StatusCode == 502 || resp.StatusCode == 503 || resp.StatusCode == 504, fmt.Errorf("download HTTP status %d", resp.StatusCode)
 	}
-
-	start := time.Now()
-	sha := sha256.New()
-	// If resuming, we need the SHA of the whole file — not just the new bytes.
-	// Rewind, hash what we kept, then continue hashing as we write the tail.
-	if existing > 0 {
+	if encoding := resp.Header.Get("Content-Encoding"); encoding != "" && encoding != "identity" {
+		return false, fmt.Errorf("unexpected content encoding")
+	}
+	if resp.StatusCode == http.StatusPartialContent {
+		if !validDownloadRange(resp.Header.Get("Content-Range"), offset, m.ZipSize) {
+			return false, fmt.Errorf("invalid Content-Range")
+		}
+		if offset > 0 && ((id.ETag != "" && resp.Header.Get("ETag") != "" && resp.Header.Get("ETag") != id.ETag) || (id.ETag == "" && id.LastModified != "" && resp.Header.Get("Last-Modified") != "" && resp.Header.Get("Last-Modified") != id.LastModified)) {
+			return false, fmt.Errorf("resume validator changed")
+		}
+	} else {
+		if err := f.Truncate(0); err != nil {
+			return false, err
+		}
 		if _, err := f.Seek(0, io.SeekStart); err != nil {
-			return nil, fmt.Errorf("rewind for hash: %w", err)
+			return false, err
 		}
-		if _, err := io.CopyN(sha, f, existing); err != nil {
-			return nil, fmt.Errorf("hash existing prefix: %w", err)
-		}
-		if _, err := f.Seek(existing, io.SeekStart); err != nil {
-			return nil, fmt.Errorf("seek to tail: %w", err)
-		}
+		offset = 0
 	}
-
+	if resp.ContentLength >= 0 && resp.ContentLength != m.ZipSize-offset {
+		return false, fmt.Errorf("response size mismatch")
+	}
+	etag := resp.Header.Get("ETag")
+	if strings.HasPrefix(etag, "W/") {
+		etag = ""
+	}
+	if offset == 0 || etag != "" {
+		id.ETag = etag
+	}
+	if offset == 0 || resp.Header.Get("Last-Modified") != "" {
+		id.LastModified = resp.Header.Get("Last-Modified")
+	}
+	if err := saveDownloadIdentity(meta, id); err != nil {
+		return false, err
+	}
 	buf := make([]byte, 256*1024)
-	var written int64
 	for {
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
 		n, readErr := resp.Body.Read(buf)
 		if n > 0 {
-			if _, werr := f.Write(buf[:n]); werr != nil {
-				return nil, fmt.Errorf("write download: %w", werr)
+			if int64(n) > m.ZipSize-offset {
+				return false, fmt.Errorf("download exceeds manifest size")
 			}
-			sha.Write(buf[:n])
-			written += int64(n)
-			if onProgress != nil {
-				onProgress(existing+written, m.ZipSize)
+			written, err := f.Write(buf[:n])
+			if err != nil {
+				return false, err
+			}
+			if written != n {
+				return false, io.ErrShortWrite
+			}
+			offset += int64(n)
+			if progress != nil {
+				progress(offset, m.ZipSize)
 			}
 		}
 		if readErr == io.EOF {
 			break
 		}
 		if readErr != nil {
-			return nil, fmt.Errorf("read download: %w", readErr)
+			return true, fmt.Errorf("read download: %w", readErr)
 		}
 	}
-
-	totalSize := existing + written
-	if totalSize != m.ZipSize {
-		return nil, fmt.Errorf("size mismatch: got %d, expected %d", totalSize, m.ZipSize)
+	if offset != m.ZipSize {
+		return true, fmt.Errorf("incomplete download: %d of %d", offset, m.ZipSize)
 	}
-
-	got := hex.EncodeToString(sha.Sum(nil))
-	if got != m.SHA256 {
-		// Hash mismatch — the resumed file is corrupt. Delete and retry
-		// from scratch (no resume) once before giving up.
-		_ = os.Remove(dest)
-		return nil, fmt.Errorf("sha256 mismatch: got %s, expected %s", got, m.SHA256)
-	}
-
-	return &DownloadResult{
-		Path:     dest,
-		Size:     totalSize,
-		SHA256:   got,
-		Duration: time.Since(start),
-	}, nil
+	return verifyDownloadPart(f, m, part)
 }
 
-// fileSHA256 is a one-shot whole-file hasher used for the "already downloaded"
-// fast path.
+func verifyDownloadPart(f *os.File, m *Manifest, part string) (bool, error) {
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return false, err
+	}
+	hash := sha256.New()
+	size, err := io.Copy(hash, f)
+	if err != nil {
+		return false, err
+	}
+	if size != m.ZipSize || hex.EncodeToString(hash.Sum(nil)) != strings.ToLower(m.SHA256) {
+		// Truncate while open (Windows cannot remove an open file). Never publish
+		// corrupt bytes; next invocation starts fresh with the same identity.
+		if err := f.Truncate(0); err != nil {
+			return false, err
+		}
+		return false, fmt.Errorf("download size/sha256 mismatch")
+	}
+	if err := f.Sync(); err != nil {
+		return false, err
+	}
+	return false, nil
+}
+
 func fileSHA256(path string) (string, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return "", err
 	}
 	defer f.Close()
-	sha := sha256.New()
-	if _, err := io.Copy(sha, f); err != nil {
+	hash := sha256.New()
+	if _, err := io.Copy(hash, f); err != nil {
 		return "", err
 	}
-	return hex.EncodeToString(sha.Sum(nil)), nil
+	return hex.EncodeToString(hash.Sum(nil)), nil
 }

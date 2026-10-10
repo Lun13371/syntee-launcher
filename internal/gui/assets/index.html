@@ -3,6 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<link rel="icon" type="image/x-icon" href="{{FAVICON}}">
 <style>/*{{STYLE}}*/</style>
 </head>
 <body>
@@ -15,12 +16,10 @@
     </div>
   </div>
   <div id="content">
-    <svg width="0" height="0" style="position:absolute"><defs>
-      <linearGradient id="logoGrad" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="#8b5cf6"/><stop offset="100%" stop-color="#6366f1"/></linearGradient>
-    </defs></svg>
+    <!-- Brand assets are embedded by pageHTML; no external file dependencies. -->
 
     <div class="screen hidden" id="screen-welcome">
-      <div class="logo-badge"><svg width="48" height="48" viewBox="0 0 48 48"><rect x="4" y="4" width="40" height="40" rx="12" fill="url(#logoGrad)"/><text x="24" y="33" text-anchor="middle" fill="white" font-size="24" font-family="system-ui" font-weight="800">S</text></svg></div>
+      <div class="logo-badge"><img src="{{LOGO}}" width="48" height="48" alt="Syntee"></div>
       <h2>Установка Syntee Helper</h2>
       <p class="version">Нажмите «Установить», чтобы начать</p>
       <div class="install-settings">
@@ -34,7 +33,7 @@
     </div>
 
     <div class="screen" id="screen-checking">
-      <div class="logo-badge"><svg width="36" height="36" viewBox="0 0 48 48"><rect x="4" y="4" width="40" height="40" rx="12" fill="url(#logoGrad)"/><text x="24" y="33" text-anchor="middle" fill="white" font-size="24" font-family="system-ui" font-weight="800">S</text></svg></div>
+      <div class="logo-badge"><img src="{{LOGO}}" width="36" height="36" alt="Syntee"></div>
       <div class="spinner"></div>
       <p class="status-text">Проверка обновлений…</p>
     </div>
@@ -86,7 +85,7 @@
     </div>
 
     <div class="screen hidden" id="screen-installed">
-      <div class="logo-badge"><svg width="44" height="44" viewBox="0 0 48 48"><rect x="4" y="4" width="40" height="40" rx="12" fill="url(#logoGrad)"/><text x="24" y="33" text-anchor="middle" fill="white" font-size="24" font-family="system-ui" font-weight="800">S</text></svg></div>
+      <div class="logo-badge"><img src="{{LOGO}}" width="44" height="44" alt="Syntee"></div>
       <h2>Syntee Helper установлен</h2>
       <p class="version" id="inst-version"></p>
       <div class="install-settings">
@@ -103,7 +102,7 @@
     </div>
 
     <div class="screen hidden" id="screen-launching">
-      <div class="logo-badge"><svg width="36" height="36" viewBox="0 0 48 48"><rect x="4" y="4" width="40" height="40" rx="12" fill="url(#logoGrad)"/><text x="24" y="33" text-anchor="middle" fill="white" font-size="24" font-family="system-ui" font-weight="800">S</text></svg></div>
+      <div class="logo-badge"><img src="{{LOGO}}" width="36" height="36" alt="Syntee"></div>
       <div class="spinner"></div>
       <p class="status-text">Запуск Syntee Helper…</p>
       <p class="countdown" id="launch-countdown">Окно закроется через 10</p>
