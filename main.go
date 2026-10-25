@@ -221,13 +221,28 @@ func runLifecycle(ctx context.Context, cfg *config.Config, client *updater.Clien
 	}
 
 	// ── 2. Already installed: check for updates ─────────────────────────
+	// Put a state on screen before any blocking work: everything below runs
+	// off the UI thread, and without this the window would sit on the boot
+	// placeholder with no feedback about what is happening.
+	g.SetState(gui.StateChecking, nil)
+
 	// Ensure shortcuts exist (they might be missing if a previous install
 	// was done before the shortcut fix, or if the user deleted them).
-	if err := setup.EnsureShortcuts(cfg); err != nil {
-		log.Printf("ensure shortcuts: %v", err)
-	}
-
-	g.SetState(gui.StateChecking, nil)
+	// Runs in the background: createShortcut shells out to PowerShell, which
+	// can block for a long time behind AV/AppLocker policy, and shortcuts are
+	// cosmetic for the update flow. A blocking repair here used to look
+	// exactly like a hung update check. It works on a freshly loaded config so
+	// it never shares state with the version/crash-count mutations below.
+	go func() {
+		repairCfg, err := config.Load()
+		if err != nil {
+			log.Printf("ensure shortcuts: reload config: %v", err)
+			return
+		}
+		if err := setup.EnsureShortcuts(repairCfg); err != nil {
+			log.Printf("ensure shortcuts: %v", err)
+		}
+	}()
 
 	// Crash-loop recovery: if current version is marked bad, restore backup.
 	if restored, rerr := rollback.RestoreIfBad(cfg); rerr != nil {

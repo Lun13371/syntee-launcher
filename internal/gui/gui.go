@@ -79,6 +79,8 @@ type GUI struct {
 
 	closed        atomic.Bool
 	clientRunning atomic.Bool
+	stateSeq      atomic.Int64
+	ackSeq        atomic.Int64
 	decisionCh    chan bool
 	retryCh       chan struct{}
 	installCh     chan InstallOptions
@@ -163,6 +165,7 @@ func (g *GUI) RunContext(parent context.Context, lifecycle func(context.Context)
 		case <-ctx.Done():
 		}
 	}()
+	go g.stateHeartbeat(ctx)
 	go func() {
 		defer close(done)
 		defer func() {
@@ -191,6 +194,7 @@ func (g *GUI) SetState(state State, payload *Payload) {
 	payload.State = state
 	g.mu.Lock()
 	g.state = *payload
+	seq := g.stateSeq.Add(1)
 	g.mu.Unlock()
 	// Always show the window for interactive states — the user may have
 	// hidden it earlier (e.g. pressed Close during download). Without this,
@@ -200,7 +204,7 @@ func (g *GUI) SetState(state State, payload *Payload) {
 	case StateError, StateLaunching, StateUpdateAvailable, StateInstalled, StateWelcome, StateDone:
 		g.Show()
 	}
-	g.push(payload)
+	g.pushSeq(payload, seq)
 }
 
 func (g *GUI) SetProgress(done, total int64) {
@@ -227,8 +231,9 @@ func (g *GUI) SetProgress(done, total int64) {
 	}
 	g.state.Progress = pr
 	payload := g.state
+	seq := g.stateSeq.Load()
 	g.mu.Unlock()
-	g.push(&payload)
+	g.pushSeq(&payload, seq)
 }
 
 func (g *GUI) ResetSpeed() {
@@ -269,12 +274,96 @@ func (g *GUI) GetCurrentState() State {
 }
 
 func (g *GUI) push(p *Payload) {
+	seq := g.stateSeq.Load()
+	g.pushSeq(p, seq)
+}
+
+// pushSeq delivers a state together with the sequence number it belongs to.
+// The page echoes that number back through stateAck, so an acknowledgement can
+// only ever confirm the exact state it applied — never a newer one that was
+// written to g.state concurrently.
+func (g *GUI) pushSeq(p *Payload, seq int64) {
 	data, err := json.Marshal(p)
 	if err != nil {
 		return
 	}
-	js := fmt.Sprintf("window.__updateState(%s)", string(data))
+	js := fmt.Sprintf("window.__updateState(%s,%d)", string(data), seq)
 	g.dispatch(func() { g.wv.Eval(js) })
+}
+
+// stateHeartbeat re-delivers the current state until the page acknowledges it,
+// then keeps a slow heartbeat running for the rest of the session.
+//
+// Why: the lifecycle goroutine starts before webview.Run(), so the first
+// SetState (welcome on a fresh install) is evaluated against a document that
+// has not run app.js yet. ExecuteScript's result is ignored, so that state was
+// silently dropped and the window sat on the default screen forever — the user
+// saw an endless "Проверка обновлений…" on a first run and could not click
+// anything. Every interactive wait (install / update decision / retry) had the
+// same exposure. Re-delivery is idempotent: __updateState only re-renders the
+// same values.
+func (g *GUI) stateHeartbeat(ctx context.Context) {
+	const (
+		fastInterval = 250 * time.Millisecond
+		slowInterval = 2 * time.Second
+		reloadAfter  = 20 // ~5s of fast retries without an ack
+		maxReloads   = 3
+	)
+	delay := fastInterval
+	pending, reloads := 0, 0
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(delay):
+		}
+		if g.closed.Load() {
+			return
+		}
+		g.mu.Lock()
+		p := g.state
+		seq := g.stateSeq.Load()
+		g.mu.Unlock()
+		if p.State != "" {
+			g.pushSeq(&p, seq)
+		}
+		delay = slowInterval
+		// A state is "pending" until the page acknowledges it. A renderer that
+		// dies mid-session stops acknowledging, which is why this compares the
+		// sequence numbers instead of using a one-shot "ever acked" flag.
+		if g.ackSeq.Load() >= seq {
+			pending = 0
+			continue
+		}
+		pending++
+		if pending < reloadAfter {
+			continue
+		}
+		pending = 0
+		if reloads >= maxReloads {
+			continue
+		}
+		// The page never came up (blank document, blocked temp file, crashed
+		// renderer). Reloading is the only in-process recovery: without it the
+		// window would stay on the boot screen and every interactive wait
+		// (install / update decision / retry) would block forever.
+		reloads++
+		log.Printf("gui: state not acknowledged by the page, reloading (%d/%d)", reloads, maxReloads)
+		g.reload()
+	}
+}
+
+// reload re-navigates to the temp HTML file. Bind scripts and the HTML file
+// survive, so a successful reload re-runs app.js and its ready handshake.
+func (g *GUI) reload() {
+	g.mu.Lock()
+	path := g.htmlPath
+	g.mu.Unlock()
+	if path == "" {
+		return
+	}
+	url := "file:///" + strings.ReplaceAll(path, "\\", "/")
+	g.dispatch(func() { g.wv.Navigate(url) })
 }
 
 func (g *GUI) bindFunctions() {
@@ -321,6 +410,33 @@ func (g *GUI) bindFunctions() {
 	})
 	bind("verifyIntegrity", func() map[string]interface{} {
 		return g.verifyIntegrity()
+	})
+	// Handshake with app.js: "ready" fires once the DOM is live, "stateAck"
+	// fires after every applied state. Together they make the initial push
+	// reliable instead of a fire-and-forget Eval into a loading document.
+	bind("ready", func() {
+		log.Printf("gui: page ready")
+		g.mu.Lock()
+		p := g.state
+		seq := g.stateSeq.Load()
+		g.mu.Unlock()
+		if p.State != "" {
+			g.pushSeq(&p, seq)
+		}
+	})
+	bind("stateAck", func(seq int64) {
+		for {
+			cur := g.ackSeq.Load()
+			if seq <= cur {
+				break
+			}
+			if g.ackSeq.CompareAndSwap(cur, seq) {
+				if cur == 0 {
+					log.Printf("gui: page acknowledged the first state")
+				}
+				break
+			}
+		}
 	})
 	bind("closeWindow", func() {
 		g.mu.Lock()

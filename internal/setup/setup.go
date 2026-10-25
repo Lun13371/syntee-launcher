@@ -15,7 +15,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"syscall"
+	"time"
 
 	"github.com/Lun13371/syntee-launcher/internal/config"
 	"github.com/Lun13371/syntee-launcher/internal/updater"
@@ -272,23 +274,43 @@ func registerApp(cfg *config.Config, opts InstallOptions) error {
 	return nil
 }
 
+// shortcutTimeout bounds the PowerShell round-trip used to create a .lnk.
+// Without it a hung powershell.exe (AV script scanning, AppLocker, broken
+// profile) blocks the caller forever, which used to freeze the launcher on
+// "Проверка обновлений…" before the update check even started.
+const shortcutTimeout = 10 * time.Second
+
 // createShortcut creates a Windows .lnk file pointing at target, using the
 // launcher exe as the brand icon. The target remains the client exe.
 // We shell out to PowerShell because Go has no native
 // .lnk support and pulling in a COM binding for one call is overkill.
 func createShortcut(lnkPath, targetPath, iconPath string) error {
 	_ = os.MkdirAll(filepath.Dir(lnkPath), 0o755)
+	// Single quotes are PowerShell string delimiters; double them so a path
+	// containing an apostrophe cannot break (or inject into) the script.
 	script := fmt.Sprintf(
 		`$ws = New-Object -ComObject WScript.Shell; $s = $ws.CreateShortcut('%s'); $s.TargetPath = '%s'; $s.IconLocation = '%s,0'; $s.WorkingDirectory = '%s'; $s.Save()`,
-		lnkPath, targetPath, iconPath, filepath.Dir(targetPath),
+		psQuote(lnkPath), psQuote(targetPath), psQuote(iconPath), psQuote(filepath.Dir(targetPath)),
 	)
-	cmd := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", script)
+	ctx, cancel := context.WithTimeout(context.Background(), shortcutTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "powershell", "-NoProfile", "-NonInteractive", "-Command", script)
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		HideWindow:    true,
 		CreationFlags: 0x08000000, // CREATE_NO_WINDOW
 	}
-	return cmd.Run()
+	cmd.WaitDelay = 2 * time.Second // don't hang on inherited handles after kill
+	if err := cmd.Run(); err != nil {
+		if ctx.Err() != nil {
+			return fmt.Errorf("create shortcut %s: powershell timed out after %s", filepath.Base(lnkPath), shortcutTimeout)
+		}
+		return fmt.Errorf("create shortcut %s: %w", filepath.Base(lnkPath), err)
+	}
+	return nil
 }
+
+// psQuote escapes a value for use inside a single-quoted PowerShell literal.
+func psQuote(s string) string { return strings.ReplaceAll(s, "'", "''") }
 
 // setAutostart writes the HKCU\...\Run entry so the client starts with Windows.
 func setAutostart(launcherPath string) error {

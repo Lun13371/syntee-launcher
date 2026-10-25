@@ -32,7 +32,16 @@
       <button class="btn btn-primary btn-install" id="btn-install">Установить</button>
     </div>
 
-    <div class="screen" id="screen-checking">
+    <!-- Boot placeholder: visible until the first state arrives. It must not
+         claim a specific phase ("Проверка обновлений…"): a state that never
+         reaches the page then looks like a hung update check. Any state
+         pushed by the host hides this screen (its id matches no state). -->
+    <div class="screen" id="screen-boot">
+      <div class="spinner"></div>
+      <p class="status-text">Запуск…</p>
+    </div>
+
+    <div class="screen hidden" id="screen-checking">
       <div class="logo-badge"><img src="{{LOGO}}" width="36" height="36" alt="Syntee"></div>
       <div class="spinner"></div>
       <p class="status-text">Проверка обновлений…</p>
