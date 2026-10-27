@@ -18,30 +18,30 @@ import (
 // dir — e.g. the user downloaded syntee-launcher.exe to Downloads and
 // double-clicked it. After self-install, the original download can be deleted.
 //
-// Returns true if the launcher self-installed and should relaunch (then exit).
-func selfInstall() bool {
+// Returns (relaunched, err). A non-nil err means the launcher could not be
+// installed: continuing from the download location would leave a second copy
+// running from an unexpected directory while holding the install mutex, which
+// looks to the user like a phantom "another installer is running".
+func selfInstall() (bool, error) {
 	if config.IsInstalled() {
-		return false // already in install dir — nothing to do
+		return false, nil // already in install dir — nothing to do
 	}
 
 	installDir := config.InstallDir()
 	exePath, err := os.Executable()
 	if err != nil {
-		log.Printf("self-install: cannot determine exe path: %v", err)
-		return false
+		return false, fmt.Errorf("не удалось определить путь к установщику: %w", err)
 	}
 
 	// Create install directory.
 	if err := os.MkdirAll(installDir, 0o755); err != nil {
-		log.Printf("self-install: mkdir %s: %v", installDir, err)
-		return false
+		return false, fmt.Errorf("не удалось создать %s: %w", installDir, err)
 	}
 
 	// Copy ourselves into the install dir.
 	dst := filepath.Join(installDir, "syntee-launcher.exe")
 	if err := copySelf(exePath, dst); err != nil {
-		log.Printf("self-install: copy: %v", err)
-		return false
+		return false, fmt.Errorf("не удалось скопировать установщик в %s: %w", installDir, err)
 	}
 	log.Printf("self-install: copied %s -> %s", exePath, dst)
 
@@ -62,19 +62,19 @@ func selfInstall() bool {
   "ready_marker": ".ready"
 }
 `, config.DefaultUpdateServer)
-		_ = os.WriteFile(cfgPath, []byte(defaultJSON), 0o644)
+		if err := os.WriteFile(cfgPath, []byte(defaultJSON), 0o644); err != nil {
+			return false, fmt.Errorf("не удалось записать %s: %w", cfgPath, err)
+		}
 		log.Printf("self-install: wrote launcher.json")
 	}
 
-	// Relaunch from install dir.
+	// Relaunch from install dir. If this fails the exe is still installed, so
+	// this copy can keep running: next launch will pick up the installed one.
 	if !relaunchFromInstall(dst) {
-		// Relaunch failed — don't exit, let this process continue
-		// running from the temp location. It's already copied to
-		// the install dir, so next launch will work normally.
 		log.Printf("self-install: relaunch failed, continuing from current location")
-		return false
+		return false, nil
 	}
-	return true
+	return true, nil
 }
 
 func copySelf(src, dst string) error {

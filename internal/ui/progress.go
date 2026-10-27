@@ -53,6 +53,14 @@ func ShowError(title, message string) {
 	_, _ = windows.MessageBox(0, m, t, mbOK|mbIconError|mbTopmost|mbSetForeground)
 }
 
+// ShowInfo pops a modal informational box and blocks until dismissed. Used for
+// non-fatal notices such as "Syntee Helper is already running".
+func ShowInfo(title, message string) {
+	t, _ := windows.UTF16PtrFromString(title)
+	m, _ := windows.UTF16PtrFromString(message)
+	_, _ = windows.MessageBox(0, m, t, mbOK|mbIconInformation|mbTopmost|mbSetForeground)
+}
+
 // FormatPercent builds a human "12.3 MB / 150.0 MB (8%)" string.
 func FormatPercent(done, total int64) string {
 	pct := 0

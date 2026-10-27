@@ -181,11 +181,24 @@ func (g *GUI) RunContext(parent context.Context, lifecycle func(context.Context)
 	g.wv.Run()
 	g.closed.Store(true)
 	cancel()
-	<-done
+	// Lifecycle normally returns as soon as the window closes, but it can be
+	// parked inside a mutation that is not context-aware (zip extract, file
+	// copy). Recovery on the next start repairs an interrupted transaction, so
+	// after a grace period we stop waiting instead of keeping the process — and
+	// the install mutex — alive forever.
+	select {
+	case <-done:
+	case <-time.After(lifecycleExitGrace):
+		log.Printf("lifecycle did not finish within %s; exiting anyway", lifecycleExitGrace)
+	}
 	if g.htmlPath != "" {
 		_ = os.Remove(g.htmlPath)
 	}
 }
+
+// lifecycleExitGrace bounds how long RunContext waits for the lifecycle
+// goroutine after the window is gone.
+const lifecycleExitGrace = 30 * time.Second
 
 func (g *GUI) SetState(state State, payload *Payload) {
 	if payload == nil {
@@ -256,7 +269,16 @@ func (g *GUI) dispatch(fn func()) {
 	}
 }
 func (g *GUI) Show() { g.dispatch(func() { showHwnd(g.hwnd, swShow) }) }
+
+// Hide removes the window from the screen entirely. Prefer Minimize for the
+// titlebar button: a hidden launcher has no taskbar entry and no tray icon, so
+// the user cannot get it back — while the process (and its single-instance
+// mutex) keeps running invisibly.
 func (g *GUI) Hide() { g.dispatch(func() { showHwnd(g.hwnd, swHide) }) }
+
+// Minimize sends a real minimize so the window stays reachable from the
+// taskbar. SetState re-shows it for interactive states.
+func (g *GUI) Minimize() { g.dispatch(func() { showHwnd(g.hwnd, swMinimize) }) }
 
 func (g *GUI) SetCountdown(sec int) {
 	js := fmt.Sprintf("window.__setCountdown(%d)", sec)
@@ -460,7 +482,7 @@ func (g *GUI) bindFunctions() {
 			g.wv.Terminate()
 		}
 	})
-	bind("minimize", func() { g.Hide() })
+	bind("minimize", func() { g.Minimize() })
 	bind("startDrag", func() { startDrag(g.hwnd) })
 }
 

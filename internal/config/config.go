@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 )
 
@@ -21,9 +22,34 @@ func InstallDir() string {
 	}
 	return filepath.Join(base, "Programs", "Syntee Helper")
 }
+
+// IsInstalled reports whether the running binary already lives inside the
+// installation tree.
 func IsInstalled() bool {
 	exe, err := os.Executable()
-	return err == nil && filepath.Dir(exe) == InstallDir()
+	return err == nil && IsInstalledExe(exe)
+}
+
+// IsInstalledExe reports whether exe is part of an existing installation.
+//
+// Two locations count:
+//   - <install>/syntee-launcher.exe — the user-facing launcher;
+//   - <install>/current/updater.exe — the copy the client spawns for its
+//     restart-to-update flow.
+//
+// Missing the second case made updater.exe believe it was a fresh download: it
+// copied itself over <install>/syntee-launcher.exe (failing on the locked file
+// while that launcher was running, or replacing it mid-update) and then
+// relaunched instead of updating.
+func IsInstalledExe(exe string) bool {
+	clean := filepath.Clean(exe)
+	dir := filepath.Dir(clean)
+	installDir := InstallDir()
+	if strings.EqualFold(dir, installDir) {
+		return true
+	}
+	return strings.EqualFold(filepath.Base(clean), "updater.exe") &&
+		strings.EqualFold(dir, filepath.Join(installDir, "current"))
 }
 
 type Config struct {
@@ -208,7 +234,6 @@ func (c *Config) IsBad(v string) bool {
 }
 func (c *Config) Dir() string             { return InstallDir() }
 func (c *Config) CurrentDir() string      { return filepath.Join(c.Dir(), "current") }
-func (c *Config) BackupsDir() string      { return filepath.Join(c.Dir(), "backups") }
 func (c *Config) StagingDir() string      { return filepath.Join(c.Dir(), "staging") }
 func (c *Config) ClientExePath() string   { return filepath.Join(c.CurrentDir(), c.ClientExe) }
 func (c *Config) ReadyMarkerPath() string { return filepath.Join(c.CurrentDir(), c.ReadyMarker) }

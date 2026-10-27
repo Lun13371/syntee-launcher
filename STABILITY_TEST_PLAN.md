@@ -24,10 +24,10 @@ go build -ldflags="-s -w -H windowsgui -X github.com/Lun13371/syntee-launcher/in
 - Use a ZIP without the client executable, with path traversal, Windows ADS paths, symlinks, or excessive unpacked size. The existing installation must remain untouched.
 - Test insufficient disk space and read-only staging/current files.
 - Hold current/ open with another process; verify bounded rename retry and a clear error.
-- Kill the launcher after old current/ is moved to backups but before new/ is promoted. On restart the installation must recover from its journal before a fresh installation starts.
+- Kill the launcher after current/ is removed but before staging/new is promoted. On restart the launcher must promote the staged package from its journal; no old-version copy is retained.
 - Kill it after promotion but before launcher.json is saved. On restart the installed version must be reconciled with the version metadata.
-- Corrupt launcher.json; verify backup recovery. Corrupt both config and backup; verify a clear error, not silent version reset.
-- Verify rollback skips known-bad or structurally invalid backups.
+- Corrupt launcher.json; verify config backup recovery. Corrupt both config and its `.bak`; verify a clear error, not silent version reset.
+- Confirm crash-loop failures do not trigger automatic version rollback; recovery only resolves an interrupted in-progress swap.
 
 ## Process and user settings
 
@@ -37,7 +37,7 @@ go build -ldflags="-s -w -H windowsgui -X github.com/Lun13371/syntee-launcher/in
 - Select no desktop shortcut/no autostart during installation, then restart the launcher. Those choices must remain respected.
 - Click Retry after update failure. It must retry, not exit.
 - Close/cancel during download and while waiting for an action. No goroutine should remain waiting indefinitely within a running launcher.
-- Start a fake client that signals ready, one that exits before ready, and one that exits normally. Only confirmed early startup failures should contribute to crash-loop rollback.
+- Start a fake client that signals ready, one that exits before ready, and one that exits normally. Early startup failures may update crash diagnostics but must not move the current version to a retained backup.
 - Close the launcher after client startup. The client must survive launcher exit.
 
 ## Security and integration limits

@@ -8,7 +8,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -18,20 +17,17 @@ const maxZipEntries = 100000
 const maxUnpackedBytes uint64 = 8 << 30
 
 // Apply preserves the legacy API while performing a journaled swap.
-func Apply(zipPath, currentDir, backupsDir, stagingDir, oldVersion string, onProgress func(int64, int64)) error {
-	return ApplyVersion(zipPath, currentDir, backupsDir, stagingDir, oldVersion, "", onProgress)
+func Apply(zipPath, currentDir, stagingDir, oldVersion string, onProgress func(int64, int64)) error {
+	return ApplyVersion(zipPath, currentDir, stagingDir, oldVersion, "", onProgress)
 }
 
-// ApplyVersion extracts and validates the package, journals every swap phase and
-// records the installed version in current/.version.
-func ApplyVersion(zipPath, currentDir, backupsDir, stagingDir, oldVersion, newVersion string, onProgress func(int64, int64)) error {
+// ApplyVersion validates the package and swaps it into current/. The previous
+// build is held only temporarily in staging/previous during promotion, then deleted.
+func ApplyVersion(zipPath, currentDir, stagingDir, oldVersion, newVersion string, onProgress func(int64, int64)) error {
 	if err := os.MkdirAll(stagingDir, 0755); err != nil {
 		return err
 	}
-	if err := os.MkdirAll(backupsDir, 0755); err != nil {
-		return err
-	}
-	if _, err := RecoverApply(currentDir, backupsDir, stagingDir); err != nil {
+	if _, err := RecoverApply(currentDir, stagingDir, filepath.Join(filepath.Dir(currentDir), "backups")); err != nil {
 		return err
 	}
 	newDir := filepath.Join(stagingDir, "new")
@@ -54,52 +50,53 @@ func ApplyVersion(zipPath, currentDir, backupsDir, stagingDir, oldVersion, newVe
 			return err
 		}
 	}
-	backupDir := filepath.Join(backupsDir, fmt.Sprintf("%s_%d", sanitizeVersion(oldVersion), time.Now().UnixNano()))
-	j := applyJournal{Phase: "prepared", Backup: backupDir, HadCurrent: false, NewVersion: newVersion}
-	if _, e := os.Stat(currentDir); e == nil {
+	previousDir := filepath.Join(stagingDir, "previous")
+	if err := os.RemoveAll(previousDir); err != nil {
+		return fmt.Errorf("clear temporary previous tree: %w", err)
+	}
+	j := applyJournal{Phase: "prepared", Previous: previousDir, NewVersion: newVersion}
+	if _, err := os.Stat(currentDir); err == nil {
 		j.HadCurrent = true
-	} else if !os.IsNotExist(e) {
-		return e
+	} else if !os.IsNotExist(err) {
+		return err
 	}
 	if err := writeJournal(stagingDir, j); err != nil {
 		return err
 	}
 	if j.HadCurrent {
-		if oldVersion != "" {
-			if err := config.AtomicWriteFile(filepath.Join(currentDir, ".version"), []byte(oldVersion+"\n"), 0644); err != nil {
-				return fmt.Errorf("record backup version: %w", err)
-			}
+		if err := RenameWithRetry(currentDir, previousDir); err != nil {
+			return fmt.Errorf("move current to temporary staging: %w", err)
 		}
-		if err := RenameWithRetry(currentDir, backupDir); err != nil {
-			return err
-		}
-		j.Phase = "backed_up"
+		j.Phase = "previous_moved"
 		if err := writeJournal(stagingDir, j); err != nil {
-			_ = RenameWithRetry(backupDir, currentDir)
+			_ = RenameWithRetry(previousDir, currentDir)
 			return err
 		}
 	}
 	if err := RenameWithRetry(newDir, currentDir); err != nil {
 		if j.HadCurrent {
-			if r := RenameWithRetry(backupDir, currentDir); r != nil {
-				return fmt.Errorf("swap failed: %v; restore failed: %w", err, r)
+			if restoreErr := RenameWithRetry(previousDir, currentDir); restoreErr != nil {
+				return fmt.Errorf("promote new current failed: %v; restore temporary previous failed: %w", err, restoreErr)
 			}
 		}
-		return fmt.Errorf("swap new -> current: %w", err)
+		return fmt.Errorf("promote staged current: %w", err)
 	}
 	j.Phase = "installed"
 	if err := writeJournal(stagingDir, j); err != nil {
 		return err
 	}
+	if err := os.RemoveAll(previousDir); err != nil {
+		return fmt.Errorf("remove temporary previous tree: %w", err)
+	}
 	_ = os.Remove(zipPath)
 	_ = os.Remove(filepath.Join(stagingDir, "apply.json"))
-	pruneBackups(backupsDir, 2)
 	return nil
 }
 
 type applyJournal struct {
 	Phase      string `json:"phase"`
-	Backup     string `json:"backup"`
+	Previous   string `json:"previous,omitempty"`
+	Backup     string `json:"backup,omitempty"` // legacy transaction compatibility
 	HadCurrent bool   `json:"had_current"`
 	NewVersion string `json:"new_version"`
 }
@@ -113,7 +110,7 @@ func writeJournal(dir string, j applyJournal) error {
 }
 
 // RecoverApply resolves an interrupted directory swap and reports the installed version when available.
-func RecoverApply(currentDir, backupsDir, stagingDir string) (string, error) {
+func RecoverApply(currentDir, stagingDir string, legacyBackupsDir ...string) (string, error) {
 	p := filepath.Join(stagingDir, "apply.json")
 	b, e := os.ReadFile(p)
 	if os.IsNotExist(e) {
@@ -126,51 +123,117 @@ func RecoverApply(currentDir, backupsDir, stagingDir string) (string, error) {
 	if e = json.Unmarshal(b, &j); e != nil {
 		return "", fmt.Errorf("invalid apply journal: %w", e)
 	}
-	if j.Phase != "prepared" && j.Phase != "backed_up" && j.Phase != "installed" {
+	if j.Phase != "prepared" && j.Phase != "previous_moved" && j.Phase != "previous_removed" && j.Phase != "backed_up" && j.Phase != "installed" {
 		return "", fmt.Errorf("unknown apply journal phase %q", j.Phase)
 	}
-	root, err := filepath.Abs(backupsDir)
-	if err != nil {
-		return "", err
+	previous := filepath.Join(stagingDir, "previous")
+	if j.Previous != "" {
+		want, err := filepath.Abs(previous)
+		if err != nil {
+			return "", err
+		}
+		got, err := filepath.Abs(j.Previous)
+		if err != nil || !strings.EqualFold(got, want) {
+			return "", fmt.Errorf("temporary previous path outside staging directory")
+		}
 	}
-	backup, err := filepath.Abs(j.Backup)
-	if err != nil || !strings.EqualFold(filepath.Dir(backup), root) || j.Backup == "" {
-		return "", fmt.Errorf("backup path outside backups directory")
+	// Legacy journal entries may point into the old backups directory. Accept
+	// them only for recovery of that in-flight transaction, never for new saves.
+	legacyBackup := ""
+	if j.Backup != "" {
+		if len(legacyBackupsDir) == 0 {
+			return "", fmt.Errorf("legacy backup journal requires legacy backup root")
+		}
+		root, err := filepath.Abs(legacyBackupsDir[0])
+		if err != nil {
+			return "", err
+		}
+		legacyBackup, e = filepath.Abs(j.Backup)
+		if e != nil || !strings.EqualFold(filepath.Dir(legacyBackup), root) {
+			return "", fmt.Errorf("legacy backup path outside legacy backups directory")
+		}
 	}
-	for _, dir := range []string{currentDir, backup} {
+	for _, dir := range []string{currentDir, previous, legacyBackup} {
+		if dir == "" {
+			continue
+		}
 		if info, err := os.Lstat(dir); err == nil && info.Mode()&os.ModeSymlink != 0 {
 			return "", fmt.Errorf("recovery directory is a link: %s", dir)
 		} else if err != nil && !os.IsNotExist(err) {
 			return "", err
 		}
 	}
-	_, currentErr := os.Stat(currentDir)
-	if currentErr != nil && !os.IsNotExist(currentErr) {
-		return "", currentErr
-	}
-	if os.IsNotExist(currentErr) && j.HadCurrent {
-		if err := validateInstall(backup); err != nil {
-			return "", fmt.Errorf("cannot recover missing current: %w", err)
-		}
-		if e = RenameWithRetry(backup, currentDir); e != nil {
-			return "", e
-		}
-	} else if os.IsNotExist(currentErr) && j.Phase == "installed" {
-		return "", fmt.Errorf("installed transaction has no current directory")
-	}
-	if j.Phase != "prepared" || !j.HadCurrent && currentErr == nil {
-		if e = validateInstall(currentDir); e != nil {
-			return "", e
+	newDir := filepath.Join(stagingDir, "new")
+	currentExists := pathExists(currentDir)
+	if j.Phase == "prepared" && !currentExists && j.HadCurrent {
+		// The current directory was moved before the journal phase update.
+		if pathExists(previous) {
+			if err := RenameWithRetry(previous, currentDir); err != nil {
+				return "", err
+			}
+			currentExists = true
+		} else if j.Backup != "" && pathExists(legacyBackup) {
+			if err := RenameWithRetry(legacyBackup, currentDir); err != nil {
+				return "", err
+			}
+			currentExists = true
 		}
 	}
-	if e = os.RemoveAll(filepath.Join(stagingDir, "new")); e != nil {
+	if (j.Phase == "previous_moved" || j.Phase == "backed_up") && !currentExists {
+		if err := validateInstall(newDir); err == nil {
+			if err := RenameWithRetry(newDir, currentDir); err != nil {
+				return "", fmt.Errorf("recover staged current: %w", err)
+			}
+			currentExists = true
+		} else if pathExists(previous) {
+			if err := RenameWithRetry(previous, currentDir); err != nil {
+				return "", err
+			}
+			currentExists = true
+		} else if pathExists(legacyBackup) {
+			if err := RenameWithRetry(legacyBackup, currentDir); err != nil {
+				return "", err
+			}
+			currentExists = true
+		} else {
+			return "", fmt.Errorf("interrupted update has no current or recoverable staged package")
+		}
+	}
+	if !currentExists && (j.Phase == "previous_removed" || j.Phase == "backed_up" || j.Phase == "installed") {
+		if err := validateInstall(newDir); err != nil {
+			return "", fmt.Errorf("interrupted update lost current and staged package: %w", err)
+		}
+		if err := RenameWithRetry(newDir, currentDir); err != nil {
+			return "", err
+		}
+		currentExists = true
+	}
+	if currentExists {
+		if err := validateInstall(currentDir); err != nil {
+			return "", err
+		}
+	}
+	if e = os.RemoveAll(newDir); e != nil {
 		return "", e
+	}
+	if j.Phase == "installed" || currentExists {
+		if e = os.RemoveAll(previous); e != nil {
+			return "", e
+		}
+	}
+	if j.Backup != "" && legacyBackup != "" {
+		_ = os.RemoveAll(legacyBackup)
 	}
 	if e = os.Remove(p); e != nil && !os.IsNotExist(e) {
 		return "", e
 	}
 	return readVersion(currentDir), nil
 }
+func pathExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
 func readVersion(dir string) string {
 	b, e := os.ReadFile(filepath.Join(dir, ".version"))
 	if e != nil {
@@ -191,54 +254,7 @@ func validateInstall(dir string) error {
 	return nil
 }
 
-func pruneBackups(backupsDir string, keepCount int) {
-	entries, e := os.ReadDir(backupsDir)
-	if e != nil {
-		return
-	}
-	type item struct {
-		p string
-		t int64
-	}
-	var a []item
-	for _, x := range entries {
-		if !x.IsDir() {
-			continue
-		}
-		if strings.HasPrefix(x.Name(), "bad_") {
-			if info, err := x.Info(); err == nil && time.Since(info.ModTime()) > 24*time.Hour {
-				_ = os.RemoveAll(filepath.Join(backupsDir, x.Name()))
-			}
-			continue
-		}
-		idx := strings.LastIndex(x.Name(), "_")
-		if idx < 1 {
-			continue
-		}
-		var t int64
-		if _, e := fmt.Sscanf(x.Name()[idx+1:], "%d", &t); e != nil {
-			continue
-		}
-		if t < 1000000000000 {
-			t *= int64(time.Second)
-		}
-		if !validBackup(filepath.Join(backupsDir, x.Name())) {
-			continue
-		}
-		a = append(a, item{filepath.Join(backupsDir, x.Name()), t})
-	}
-	sort.Slice(a, func(i, j int) bool { return a[i].t > a[j].t })
-	if keepCount < 0 {
-		keepCount = 0
-	}
-	if len(a) <= keepCount {
-		return
-	}
-	for _, x := range a[keepCount:] {
-		_ = os.RemoveAll(x.p)
-	}
-}
-func validBackup(p string) bool { return validateInstall(p) == nil }
+// The new package is staged and validated before the old current directory is removed.
 
 func unzip(zipPath, dst string, onProgress func(int64, int64)) error {
 	r, e := zip.OpenReader(zipPath)
@@ -344,20 +360,10 @@ func safeJoin(dst, name string) (string, error) {
 	}
 	return joined, nil
 }
-func sanitizeVersion(v string) string {
-	if v == "" {
-		return "unknown"
-	}
-	return strings.Map(func(r rune) rune {
-		if r == '/' || r == '\\' || r == ':' {
-			return '_'
-		}
-		return r
-	}, v)
-}
 
 const renameBackoffTries = 12
 
+// RenameWithRetry bounds transient Windows sharing violations during a swap.
 func RenameWithRetry(src, dst string) error { return renameWithRetry(src, dst, renameBackoffTries) }
 func renameWithRetry(src, dst string, tries int) error {
 	wait := 200 * time.Millisecond

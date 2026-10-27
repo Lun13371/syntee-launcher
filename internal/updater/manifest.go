@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/url"
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/Masterminds/semver/v3"
@@ -50,6 +51,22 @@ func (m *Manifest) Validate(expectedChannel ...string) error {
 		return fmt.Errorf("invalid sha256")
 	}
 	return validateUpdateURL(m.ZipURL)
+}
+
+func upgradeSameHostArtifactURL(serverURL, artifactURL string) string {
+	server, err := url.Parse(serverURL)
+	if err != nil || !strings.EqualFold(server.Scheme, "https") {
+		return artifactURL
+	}
+	artifact, err := url.Parse(artifactURL)
+	if err != nil || !strings.EqualFold(artifact.Scheme, "http") || artifact.Host == "" {
+		return artifactURL
+	}
+	if !strings.EqualFold(artifact.Hostname(), server.Hostname()) {
+		return artifactURL
+	}
+	artifact.Scheme = "https"
+	return artifact.String()
 }
 
 func validateUpdateURL(raw string) error {

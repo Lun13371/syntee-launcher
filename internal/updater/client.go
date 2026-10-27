@@ -88,6 +88,11 @@ func (c *Client) Check(ctx context.Context, channel, current string) (*Manifest,
 		if err := dec.Decode(&extra); err != io.EOF {
 			return nil, fmt.Errorf("manifest has trailing data")
 		}
+		// Some gateway manifests still advertise the artifact URL as HTTP even
+		// though the same endpoint is available over HTTPS. Upgrade only a
+		// same-host URL from an HTTPS update server; never change an arbitrary
+		// download host or relax validateUpdateURL's HTTPS requirement.
+		m.ZipURL = upgradeSameHostArtifactURL(c.serverURL, m.ZipURL)
 		if err := m.Validate(channel); err != nil {
 			return nil, err
 		}

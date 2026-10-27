@@ -22,7 +22,7 @@ import (
 //  1. Shortcuts (Start Menu, Desktop)
 //  2. Autostart registry key
 //  3. Uninstall registry entry ("Programs and Features")
-//  4. Client files: current/, backups/, staging/, launcher.json, logs
+//  4. Client files: current/, staging/, launcher.json, logs
 //  5. The launcher binary itself (scheduled via a detached cmd process
 //     that waits 2 seconds then deletes the exe — we can't delete ourselves
 //     while running).
@@ -58,7 +58,7 @@ func Uninstall(cfg *config.Config, quiet bool) {
 	// 4. Remove client files.
 	dirsToRemove := []string{
 		cfg.CurrentDir(),
-		cfg.BackupsDir(),
+		filepath.Join(cfg.Dir(), "backups"), // remove data left by older launcher versions
 		cfg.StagingDir(),
 	}
 	filesToRemove := []string{

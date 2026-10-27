@@ -31,7 +31,7 @@ func writeZip(t *testing.T, p string, entries map[string]string) {
 func TestApplyVersionAndRecovery(t *testing.T) {
 	root := t.TempDir()
 	cur := filepath.Join(root, "current")
-	back := filepath.Join(root, "backups")
+	back := filepath.Join(root, "backups") // legacy location, must not be created
 	stage := filepath.Join(root, "stage")
 	_ = os.MkdirAll(filepath.Join(cur, "resources"), 0755)
 	_ = os.WriteFile(filepath.Join(cur, "Syntee Helper.exe"), []byte("old"), 0644)
@@ -39,13 +39,19 @@ func TestApplyVersionAndRecovery(t *testing.T) {
 	z := filepath.Join(stage, "update.zip")
 	_ = os.MkdirAll(stage, 0755)
 	writeZip(t, z, map[string]string{"Syntee Helper.exe": "new", "resources/app.asar": "new"})
-	if e := ApplyVersion(z, cur, back, stage, "1", "2", nil); e != nil {
+	if e := ApplyVersion(z, cur, stage, "1", "2", nil); e != nil {
 		t.Fatal(e)
 	}
 	if v := readVersion(cur); v != "2" {
 		t.Fatalf("version %q", v)
 	}
-	if v, e := RecoverApply(cur, back, stage); e != nil || v != "2" {
+	if _, err := os.Stat(back); !os.IsNotExist(err) {
+		t.Fatalf("retained backup directory: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(stage, "previous")); !os.IsNotExist(err) {
+		t.Fatalf("temporary previous tree was not removed: %v", err)
+	}
+	if v, e := RecoverApply(cur, stage); e != nil || v != "2" {
 		t.Fatalf("recover %q %v", v, e)
 	}
 }
@@ -57,29 +63,37 @@ func TestApplyRejectsUnsafeAndIncompleteZip(t *testing.T) {
 			_ = os.MkdirAll(stage, 0755)
 			z := filepath.Join(stage, "x.zip")
 			writeZip(t, z, map[string]string{name: "x"})
-			e := ApplyVersion(z, filepath.Join(root, "cur"), filepath.Join(root, "back"), stage, "", "1", nil)
+			e := ApplyVersion(z, filepath.Join(root, "cur"), stage, "", "1", nil)
 			if e == nil {
 				t.Fatal("accepted unsafe/incomplete archive")
 			}
 		})
 	}
 }
-func TestRecoveryRestoresBackup(t *testing.T) {
+func TestRecoveryCompletesTemporarySwap(t *testing.T) {
 	root := t.TempDir()
 	cur := filepath.Join(root, "current")
-	back := filepath.Join(root, "backups", "v1_1")
 	stage := filepath.Join(root, "stage")
-	_ = os.MkdirAll(filepath.Join(back, "resources"), 0755)
-	_ = os.MkdirAll(stage, 0755)
-	_ = os.WriteFile(filepath.Join(back, "Syntee Helper.exe"), []byte("x"), 0644)
-	_ = os.WriteFile(filepath.Join(back, "resources", "app.asar"), []byte("x"), 0644)
-	if e := writeJournal(stage, applyJournal{Phase: "backed_up", Backup: back, HadCurrent: true}); e != nil {
-		t.Fatal(e)
+	newDir := filepath.Join(stage, "new")
+	previous := filepath.Join(stage, "previous")
+	_ = os.MkdirAll(filepath.Join(newDir, "resources"), 0755)
+	_ = os.MkdirAll(filepath.Join(previous, "resources"), 0755)
+	_ = os.WriteFile(filepath.Join(newDir, "Syntee Helper.exe"), []byte("new"), 0644)
+	_ = os.WriteFile(filepath.Join(newDir, "resources", "app.asar"), []byte("new"), 0644)
+	_ = os.WriteFile(filepath.Join(newDir, ".version"), []byte("2\n"), 0644)
+	_ = os.WriteFile(filepath.Join(previous, "Syntee Helper.exe"), []byte("old"), 0644)
+	_ = os.WriteFile(filepath.Join(previous, "resources", "app.asar"), []byte("old"), 0644)
+	if err := writeJournal(stage, applyJournal{Phase: "previous_moved", Previous: previous, HadCurrent: true, NewVersion: "2"}); err != nil {
+		t.Fatal(err)
 	}
-	if _, e := RecoverApply(cur, filepath.Dir(back), stage); e != nil {
-		t.Fatal(e)
+	if version, err := RecoverApply(cur, stage); err != nil || version != "2" {
+		t.Fatalf("recovery version=%q err=%v", version, err)
 	}
-	if _, e := os.Stat(filepath.Join(cur, "Syntee Helper.exe")); e != nil {
-		t.Fatal(e)
+	data, err := os.ReadFile(filepath.Join(cur, "Syntee Helper.exe"))
+	if err != nil || string(data) != "new" {
+		t.Fatalf("new current missing or incorrect: %q %v", data, err)
+	}
+	if _, err := os.Stat(previous); !os.IsNotExist(err) {
+		t.Fatalf("temporary previous tree was not removed: %v", err)
 	}
 }

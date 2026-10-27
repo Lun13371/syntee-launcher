@@ -97,7 +97,7 @@ func RunIfNeededWithOptions(ctx context.Context, cfg *config.Config, client *upd
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if err := updater.ApplyVersion(res.Path, cfg.CurrentDir(), cfg.BackupsDir(), cfg.StagingDir(), cfg.CurrentVersion, manifest.Version, onProgress); err != nil {
+		if err := updater.ApplyVersion(res.Path, cfg.CurrentDir(), cfg.StagingDir(), cfg.CurrentVersion, manifest.Version, onProgress); err != nil {
 			return fmt.Errorf("extract client: %w", err)
 		}
 

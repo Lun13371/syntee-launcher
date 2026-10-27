@@ -19,6 +19,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -31,7 +32,6 @@ import (
 
 	"github.com/Lun13371/syntee-launcher/internal/config"
 	"github.com/Lun13371/syntee-launcher/internal/gui"
-	"github.com/Lun13371/syntee-launcher/internal/rollback"
 	"github.com/Lun13371/syntee-launcher/internal/runner"
 	"github.com/Lun13371/syntee-launcher/internal/setup"
 	"github.com/Lun13371/syntee-launcher/internal/ui"
@@ -41,59 +41,141 @@ import (
 func jsonMarshal(v any) ([]byte, error)      { return json.MarshalIndent(v, "", "  ") }
 func jsonUnmarshal(data []byte, v any) error { return json.Unmarshal(data, v) }
 
+// launcherWindowTitle must match gui.WindowOptions.Title so a second launch
+// can find and focus the existing window.
+const launcherWindowTitle = "Syntee Helper"
+
+// Exit codes for background (updater.exe) mode, where nobody can dismiss a
+// dialog: the client can tell "busy, retry later" from a real failure.
+const (
+	exitLockBusy   = 3
+	exitLockError  = 4
+	updaterTempArg = "--syntee-updater-temp"
+)
+
+// mutationLockWait bounds how long the GUI waits for a concurrent mutation
+// (another instance downloading/applying) before reporting it to the user.
+const mutationLockWait = 10 * time.Second
+
+type runMode int
+
+const (
+	modeInteractive runMode = iota // user-launched syntee-launcher.exe
+	modeUpdater                    // client-spawned current/updater.exe
+)
+
+// currentMode distinguishes the user-facing launcher from the copy the client
+// spawns for its restart-to-update flow. updater.exe runs with nobody in front
+// of it: it must never block on a MessageBox, and it should wait longer for a
+// concurrent mutation instead of failing immediately.
+func currentMode() runMode {
+	exe, err := os.Executable()
+	if err != nil {
+		return modeInteractive
+	}
+	if strings.EqualFold(filepath.Base(exe), "updater.exe") {
+		return modeUpdater
+	}
+	return modeInteractive
+}
+
 func main() {
 	// Waiting instances must not hold current/ as their working directory.
 	chdirToTemp()
-	release, err := setup.AcquireInstallLock(config.InstallDir())
-	if err != nil {
-		ui.ShowError("Syntee Helper", err.Error())
-		return
-	}
-	defer release()
+	// Log before anything can fail. A lock conflict is exactly the situation
+	// that needs a diagnostic trail, and it used to be silent (MessageBox only).
 	initLogging()
 	defer logSync()
 
-	log.Printf("syntee-launcher starting (pid=%d, args=%v)", os.Getpid(), os.Args[1:])
+	mode := currentMode()
+	log.Printf("syntee-launcher starting (pid=%d, mode=%v, args=%v)", os.Getpid(), mode, os.Args[1:])
 
-	// Release any inherited working directory that points inside the install
-	// tree. The client spawns us (current/updater.exe) with cwd inherited
-	// from itself — and the client runs with cwd=current/ (we set cmd.Dir
-	// when launching it). Windows refuses to rename a directory that is any
-	// process's CWD, so as long as we — or the WebView2 helper processes the
-	// GUI spawns later, which inherit our CWD at creation time — sit in
-	// current/, the apply step can never rename it ("being used by another
-	// process"). Chdir to a neutral location BEFORE creating the GUI.
-	chdirToTemp()
+	// updater.exe normally runs from current/, which Windows will not allow
+	// us to rename during ApplyVersion. Relaunch an identical copy from Temp
+	// before taking locks or touching the installation tree.
+	if mode == modeUpdater && !hasUpdaterTempArg(os.Args[1:]) {
+		if err := relaunchUpdaterFromTemp(os.Args[1:]); err != nil {
+			log.Printf("updater temp relaunch failed: %v", err)
+			os.Exit(exitLockError)
+		}
+		return
+	}
 
-	// --uninstall: no GUI, use MessageBox.
+	// --uninstall: no GUI, use MessageBox. It mutates everything, so it takes
+	// the install lock itself.
 	for _, arg := range os.Args[1:] {
 		if arg == "--uninstall" || arg == "-uninstall" {
-			cfg, err := config.Load()
-			if err != nil {
-				ui.ShowError("Syntee Helper", "Не удалось прочитать конфигурацию: "+err.Error())
-				os.Exit(1)
-			}
-			quiet := false
-			for _, a := range os.Args[1:] {
-				if a == "--quiet" || a == "-quiet" {
-					quiet = true
-				}
-			}
-			setup.Uninstall(cfg, quiet)
+			runUninstall()
 			return
 		}
 	}
+
+	// Only one interactive launcher window may exist. This is a separate,
+	// process-lifetime mutex — NOT the install mutex. Holding the install
+	// mutex for the whole GUI session (as a deferred release from main) meant
+	// every second launch failed with "another installer is running (wait
+	// result 258)" while the first window merely waited for a click, and it
+	// also blocked the client's restart-to-update flow.
+	if mode == modeInteractive {
+		release, acquired, err := setup.AcquireSingleInstance(config.InstallDir())
+		if err != nil {
+			log.Printf("single instance: %v", err)
+			ui.ShowError(launcherWindowTitle, err.Error())
+			return
+		}
+		if !acquired {
+			log.Printf("another launcher instance is already running")
+			if ui.ActivateWindow(launcherWindowTitle) {
+				return
+			}
+			ui.ShowInfo(launcherWindowTitle,
+				"Syntee Helper уже запущен.\n\n"+
+					"Окно установщика не удалось показать — вероятно, оно свёрнуто "+
+					"или ещё создаётся. Найдите его на панели задач.")
+			return
+		}
+		defer release()
+	}
+
+	// Mutation lock: held only while the launcher actually changes something.
+	lockWait := defaultLockWait(mode)
+	release, err := setup.AcquireInstallLockTimeout(config.InstallDir(), lockWait)
+	if err != nil {
+		if exit, code := handleLockFailure(mode, err); exit {
+			os.Exit(code)
+		}
+		return
+	}
+	released := false
+	releaseLock := func() {
+		if !released {
+			released = true
+			release()
+		}
+	}
+	// Safety net for the early returns below; the happy path releases before
+	// the window opens so the GUI never holds the mutex.
+	defer releaseLock()
 
 	// Self-install: if not running from the install dir, copy ourselves
 	// to %LOCALAPPDATA%\Programs\Syntee Helper\ and relaunch from there.
 	// This makes the launcher behave like a normal installer when the user
 	// downloads it to Downloads and double-clicks.
-	if selfInstall() {
+	relaunchedFromTemp := mode == modeUpdater && hasUpdaterTempArg(os.Args[1:])
+	if relaunched, err := selfInstallIfNeeded(relaunchedFromTemp); err != nil {
+		log.Printf("self-install: %v", err)
+		releaseLock()
+		ui.ShowError(launcherWindowTitle,
+			"Не удалось установить Syntee Helper.\n\n"+err.Error()+
+				"\n\nЗапустите установщик ещё раз.")
+		return
+	} else if relaunched {
 		return // relaunch happened, exit this temp copy
 	}
 
 	cfg, err := config.Load()
 	if err != nil {
+		releaseLock()
 		ui.ShowError("Syntee Launcher", "Failed to read launcher.json: "+err.Error())
 		os.Exit(1)
 	}
@@ -111,34 +193,39 @@ func main() {
 
 	// Resolve an interrupted swap before any current/-dependent operation.
 	if err := setup.RecoverInstallation(cfg); err != nil {
-		ui.ShowError("Syntee Helper", err.Error())
+		releaseLock()
+		ui.ShowError(launcherWindowTitle, err.Error())
 		return
 	}
-	if cfg.IsBad(cfg.CurrentVersion) {
-		if err := runner.StopProcessesIn(context.Background(), cfg.CurrentDir(), 2*time.Second); err != nil {
-			ui.ShowError("Syntee Helper", err.Error())
-			return
-		}
-		if _, err := rollback.RestoreIfBad(cfg); err != nil {
-			ui.ShowError("Syntee Helper", err.Error())
-			return
-		}
-		if err := cfg.Save(); err != nil {
-			ui.ShowError("Syntee Helper", err.Error())
-			return
-		}
-	}
+	// Known-bad versions remain recorded for diagnostics, but no automatic
+	// rollback is performed; users can install a later release normally.
 
 	// Keep current/updater.exe in sync with this binary on EVERY launch — the
 	// client's quit-and-install spawns updater.exe, so it must be the freshest
 	// launcher build, not whatever happened to apply the last update.
 	syncUpdaterExe(cfg)
 
+	// Startup mutations are done: release the install mutex BEFORE the window
+	// opens. From here on it is taken only around individual mutations
+	// (see withInstallLock), so a second launch — or the client's updater.exe —
+	// can proceed while this window waits for a click.
+	releaseLock()
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go handleSignals(cancel)
 
 	client := updater.NewClient(cfg)
+
+	// Release any inherited working directory that points inside the install
+	// tree. The client spawns us (current/updater.exe) with cwd inherited from
+	// itself — and the client runs with cwd=current/ (we set cmd.Dir when
+	// launching it). Windows refuses to rename a directory that is any
+	// process's CWD, so as long as we — or the WebView2 helper processes the
+	// GUI spawns later, which inherit our CWD at creation time — sit in
+	// current/, the apply step can never rename it ("being used by another
+	// process"). Chdir to a neutral location BEFORE creating the GUI.
+	chdirToTemp()
 
 	// Try GUI mode. If WebView2 is unavailable and can't be installed,
 	// fall back to the headless MessageBox UI.
@@ -153,6 +240,99 @@ func main() {
 
 	g.RunContext(ctx, func(guiCtx context.Context) { runLifecycle(guiCtx, cfg, client, g) })
 }
+
+// defaultLockWait is the budget for acquiring the install mutex.
+func defaultLockWait(mode runMode) time.Duration {
+	if mode == modeUpdater {
+		// Spawned by the client in the background after it quit: nobody is
+		// watching, so wait out a running launcher/update instead of failing.
+		return 3 * time.Minute
+	}
+	return mutationLockWait
+}
+
+// handleLockFailure reports a failed lock acquisition in the form appropriate
+// for the mode. It returns exit=true (with a code) only for background mode,
+// where a dialog would be invisible to the user.
+func handleLockFailure(mode runMode, err error) (exit bool, code int) {
+	busy := errors.Is(err, setup.ErrLockBusy)
+	log.Printf("install lock: %v (busy=%v)", err, busy)
+
+	if mode == modeUpdater {
+		if busy {
+			return true, exitLockBusy
+		}
+		return true, exitLockError
+	}
+
+	if busy {
+		// Someone is genuinely mid-mutation. Focus their window if we can,
+		// otherwise say what is happening instead of dumping the raw
+		// "wait result 258".
+		if ui.ActivateWindow(launcherWindowTitle) {
+			return false, 0
+		}
+		ui.ShowInfo(launcherWindowTitle,
+			"Syntee Helper уже обновляется.\n\n"+
+				"Дождитесь завершения и попробуйте снова.")
+		return false, 0
+	}
+	ui.ShowError(launcherWindowTitle, err.Error())
+	return false, 0
+}
+
+// withInstallLock runs fn under the installation mutex. Mutations are
+// serialized against a client-spawned updater.exe or another launcher, but the
+// lock is never held while the window waits for the user.
+func withInstallLock(fn func() error) error {
+	release, err := setup.AcquireInstallLockTimeout(config.InstallDir(), mutationLockWait)
+	if err != nil {
+		return err
+	}
+	defer release()
+	return fn()
+}
+
+// describeMutationError turns a lock conflict into an actionable message.
+func describeMutationError(err error) string {
+	if errors.Is(err, setup.ErrLockBusy) {
+		return "Установка уже выполняется другим процессом.\n\n" +
+			"Дождитесь её завершения и нажмите «Повторить»."
+	}
+	return err.Error()
+}
+
+// runUninstall handles --uninstall under the install mutex.
+func runUninstall() {
+	cfg, err := config.Load()
+	if err != nil {
+		ui.ShowError(launcherWindowTitle, "Не удалось прочитать конфигурацию: "+err.Error())
+		os.Exit(1)
+	}
+	quiet := false
+	for _, a := range os.Args[1:] {
+		if a == "--quiet" || a == "-quiet" {
+			quiet = true
+		}
+	}
+	release, err := setup.AcquireInstallLockTimeout(config.InstallDir(), defaultInstallLockWait)
+	if err != nil {
+		log.Printf("uninstall lock: %v", err)
+		if errors.Is(err, setup.ErrLockBusy) {
+			ui.ShowError(launcherWindowTitle,
+				"Syntee Helper сейчас обновляется, удаление невозможно.\n\n"+
+					"Дождитесь завершения и повторите попытку.")
+			os.Exit(exitLockBusy)
+		}
+		ui.ShowError(launcherWindowTitle, err.Error())
+		os.Exit(exitLockError)
+	}
+	defer release()
+	setup.Uninstall(cfg, quiet)
+}
+
+// defaultInstallLockWait mirrors setup's default budget for uninstall.
+const defaultInstallLockWait = 30 * time.Second
 
 // runLifecycle is the GUI-mode lifecycle. It runs in a goroutine alongside
 // the webview message loop. State changes are pushed to the frontend via
@@ -183,27 +363,31 @@ func runLifecycle(ctx context.Context, cfg *config.Config, client *updater.Clien
 		g.ResetSpeed()
 
 		for {
-			err := setup.RunIfNeededWithOptions(ctx, cfg, client, setup.InstallOptions{
-				DesktopShortcut:   installOpts.DesktopShortcut,
-				StartMenuShortcut: installOpts.StartMenuShortcut,
-				Autostart:         installOpts.Autostart,
-			},
-				g.SetProgress,
-				func(phase string) {
-					switch phase {
-					case "download":
-					case "extract":
-						g.SetState(gui.StateExtracting, nil)
-						g.ResetSpeed()
-					}
+			// The install mutex is taken only for the install itself, never
+			// while this window waits for a click.
+			err := withInstallLock(func() error {
+				return setup.RunIfNeededWithOptions(ctx, cfg, client, setup.InstallOptions{
+					DesktopShortcut:   installOpts.DesktopShortcut,
+					StartMenuShortcut: installOpts.StartMenuShortcut,
+					Autostart:         installOpts.Autostart,
 				},
-			)
+					g.SetProgress,
+					func(phase string) {
+						switch phase {
+						case "download":
+						case "extract":
+							g.SetState(gui.StateExtracting, nil)
+							g.ResetSpeed()
+						}
+					},
+				)
+			})
 			if err != nil {
 				log.Printf("first-run setup failed: %v", err)
 				g.SetState(gui.StateError, &gui.Payload{
 					ErrorMessage: "Не удалось загрузить клиент с сервера.\n\n" +
 						"Проверьте подключение к интернету.\n\n" +
-						"Ошибка: " + err.Error(),
+						"Ошибка: " + describeMutationError(err),
 				})
 				if _, ok := waitChannel(ctx, g.RetryCh()); !ok {
 					return
@@ -244,22 +428,14 @@ func runLifecycle(ctx context.Context, cfg *config.Config, client *updater.Clien
 		}
 	}()
 
-	// Crash-loop recovery: if current version is marked bad, restore backup.
-	if restored, rerr := rollback.RestoreIfBad(cfg); rerr != nil {
-		log.Printf("rollback failed: %v", rerr)
-	} else if restored != "" {
-		log.Printf("restored previous version %s after crash-loop", restored)
-		if err := cfg.Save(); err != nil {
-			log.Printf("save config after restore: %v", err)
-		}
-	}
+	// Crash-loop rollback was removed; bad_versions remain diagnostic only.
 
 	manifest, err := client.Check(ctx, cfg.Channel, cfg.CurrentVersion)
 	if err != nil {
 		log.Printf("update check failed: %v", err)
 	}
 
-	if err == nil && manifest != nil && !cfg.IsBad(manifest.Version) && updater.IsNewer(cfg.CurrentVersion, manifest.Version) {
+	if err == nil && manifest != nil && updater.IsNewer(cfg.CurrentVersion, manifest.Version) {
 		log.Printf("update available: %s -> %s (force=%v)", cfg.CurrentVersion, manifest.Version, manifest.Force)
 		if manifest.Force {
 			g.SetState(gui.StateForcedUpdate, &gui.Payload{
@@ -443,19 +619,7 @@ func launchAndMonitor(ctx context.Context, cfg *config.Config) error {
 func fileExists(path string) bool { _, err := os.Stat(path); return err == nil }
 
 func recordStartupFailure(cfg *config.Config, cause error) error {
-	count := cfg.IncrementCrashCount()
-	if count >= cfg.MaxCrashRetries {
-		cfg.AddBadVersion(cfg.CurrentVersion)
-		if err := runner.StopProcessesIn(context.Background(), cfg.CurrentDir(), time.Second); err != nil {
-			return fmt.Errorf("%v; stop helpers: %w", cause, err)
-		}
-		if err := cfg.Save(); err != nil {
-			return err
-		}
-		if _, err := rollback.RestoreIfBad(cfg); err != nil {
-			return fmt.Errorf("%v; rollback: %w", cause, err)
-		}
-	}
+	cfg.IncrementCrashCount()
 	if err := cfg.Save(); err != nil {
 		return fmt.Errorf("%v; save: %w", cause, err)
 	}
@@ -485,7 +649,7 @@ func updateWithRetry(ctx context.Context, cfg *config.Config, client *updater.Cl
 			if ctx.Err() != nil {
 				return false
 			}
-			g.SetState(gui.StateError, &gui.Payload{ErrorMessage: "Ошибка обновления: " + err.Error()})
+			g.SetState(gui.StateError, &gui.Payload{ErrorMessage: "Ошибка обновления: " + describeMutationError(err)})
 			if _, ok := waitChannel(ctx, g.RetryCh()); !ok {
 				return false
 			}
@@ -510,6 +674,49 @@ func chdirToTemp() {
 	log.Printf("chdir -> %s", tmp)
 }
 
+func hasUpdaterTempArg(args []string) bool {
+	for _, arg := range args {
+		if arg == updaterTempArg {
+			return true
+		}
+	}
+	return false
+}
+
+func selfInstallIfNeeded(skip bool) (bool, error) {
+	if skip {
+		return false, nil
+	}
+	return selfInstall()
+}
+
+func relaunchUpdaterFromTemp(args []string) error {
+	exe, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("locate updater: %w", err)
+	}
+	dir, err := os.MkdirTemp(os.TempDir(), "syntee-updater-")
+	if err != nil {
+		return fmt.Errorf("create temporary updater directory: %w", err)
+	}
+	tempExe := filepath.Join(dir, "updater.exe")
+	if err := setup.CopyFileAtomic(exe, tempExe); err != nil {
+		_ = os.RemoveAll(dir)
+		return fmt.Errorf("copy updater to temporary directory: %w", err)
+	}
+	childArgs := append([]string{updaterTempArg}, args...)
+	proc, err := os.StartProcess(tempExe, append([]string{tempExe}, childArgs...), &os.ProcAttr{Files: []*os.File{nil, nil, nil}})
+	if err != nil {
+		_ = os.RemoveAll(dir)
+		return fmt.Errorf("start temporary updater: %w", err)
+	}
+	if err := proc.Release(); err != nil {
+		return fmt.Errorf("release temporary updater process: %w", err)
+	}
+	log.Printf("restarted updater from temporary path %s", tempExe)
+	return nil
+}
+
 // killClientIfRunning only targets actual process images under current/.
 func killClientIfRunning(ctx context.Context, cfg *config.Config) error {
 	return runner.StopProcessesIn(ctx, cfg.CurrentDir(), 2*time.Second)
@@ -517,39 +724,46 @@ func killClientIfRunning(ctx context.Context, cfg *config.Config) error {
 
 // doUpdate downloads and applies an update, reporting progress to the GUI.
 // Used for both forced and user-accepted updates.
+//
+// The whole sequence runs under the install mutex so a client-spawned
+// updater.exe or a second launcher cannot download into the same staging
+// directory or swap current/ concurrently. The lock is scoped to this call,
+// never to the window lifetime.
 func doUpdate(ctx context.Context, cfg *config.Config, client *updater.Client, m *updater.Manifest, g *gui.GUI) error {
 	if err := setup.ValidateRelease(cfg, m); err != nil {
 		return err
 	}
-	res, err := client.DownloadToStaging(ctx, m, cfg.StagingDir(), func(done, total int64) {
-		g.SetProgress(done, total)
+	return withInstallLock(func() error {
+		res, err := client.DownloadToStaging(ctx, m, cfg.StagingDir(), func(done, total int64) {
+			g.SetProgress(done, total)
+		})
+		if err != nil {
+			return fmt.Errorf("download: %w", err)
+		}
+		log.Printf("downloaded %s in %s (sha256 ok)", res.Path, res.Duration)
+
+		g.SetState(gui.StateExtracting, nil)
+		g.ResetSpeed()
+		if err := killClientIfRunning(ctx, cfg); err != nil {
+			return err
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := updater.ApplyVersion(res.Path, cfg.CurrentDir(), cfg.StagingDir(), cfg.CurrentVersion, m.Version,
+			func(done, total int64) { g.SetProgress(done, total) }); err != nil {
+			return fmt.Errorf("apply: %w", err)
+		}
+
+		cfg.SetCurrentVersion(m.Version)
+		if err := cfg.Save(); err != nil {
+			log.Printf("save config after apply: %v", err)
+		}
+		copyUpdaterAfterApply(cfg)
+		_ = os.Remove(filepath.Join(cfg.StagingDir(), "update.json"))
+		log.Printf("applied update -> %s", m.Version)
+		return nil
 	})
-	if err != nil {
-		return fmt.Errorf("download: %w", err)
-	}
-	log.Printf("downloaded %s in %s (sha256 ok)", res.Path, res.Duration)
-
-	g.SetState(gui.StateExtracting, nil)
-	g.ResetSpeed()
-	if err := killClientIfRunning(ctx, cfg); err != nil {
-		return err
-	}
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	if err := updater.ApplyVersion(res.Path, cfg.CurrentDir(), cfg.BackupsDir(), cfg.StagingDir(), cfg.CurrentVersion, m.Version,
-		func(done, total int64) { g.SetProgress(done, total) }); err != nil {
-		return fmt.Errorf("apply: %w", err)
-	}
-
-	cfg.SetCurrentVersion(m.Version)
-	if err := cfg.Save(); err != nil {
-		log.Printf("save config after apply: %v", err)
-	}
-	copyUpdaterAfterApply(cfg)
-	_ = os.Remove(filepath.Join(cfg.StagingDir(), "update.json"))
-	log.Printf("applied update -> %s", m.Version)
-	return nil
 }
 
 // copyUpdaterAfterApply copies the launcher exe into current/updater.exe
@@ -587,28 +801,23 @@ func runHeadless(ctx context.Context, cfg *config.Config, client *updater.Client
 		}
 	}
 
-	if err := setup.RunIfNeeded(ctx, cfg, client, onProgress, onPhase); err != nil {
+	if err := withInstallLock(func() error {
+		return setup.RunIfNeeded(ctx, cfg, client, onProgress, onPhase)
+	}); err != nil {
 		log.Printf("first-run setup failed: %v", err)
 		ui.ShowError("Syntee Helper — установка",
 			"Не удалось загрузить клиент с сервера.\n\n"+
 				"Проверьте подключение к интернету и попробуйте снова.\n\n"+
-				"Ошибка: "+err.Error())
+				"Ошибка: "+describeMutationError(err))
 		os.Exit(1)
 	}
 
-	if restored, rerr := rollback.RestoreIfBad(cfg); rerr != nil {
-		log.Printf("rollback failed: %v", rerr)
-	} else if restored != "" {
-		log.Printf("restored previous version %s after crash-loop", restored)
-		if err := cfg.Save(); err != nil {
-			log.Printf("save config after restore: %v", err)
-		}
-	}
+	// Crash-loop rollback was removed; bad_versions remain diagnostic only.
 
 	manifest, err := client.Check(ctx, cfg.Channel, cfg.CurrentVersion)
 	if err != nil {
 		log.Printf("update check failed: %v", err)
-	} else if manifest != nil && !cfg.IsBad(manifest.Version) && updater.IsNewer(cfg.CurrentVersion, manifest.Version) {
+	} else if manifest != nil && updater.IsNewer(cfg.CurrentVersion, manifest.Version) {
 		log.Printf("update available: %s -> %s (force=%v)", cfg.CurrentVersion, manifest.Version, manifest.Force)
 		if manifest.Force {
 			if err := doForcedUpdateHeadless(ctx, cfg, client, manifest); err != nil {
@@ -631,28 +840,30 @@ func doForcedUpdateHeadless(ctx context.Context, cfg *config.Config, client *upd
 	}
 	ui.ShowForceProgress("Загрузка обновления " + m.Version + "…")
 
-	res, err := client.DownloadToStaging(ctx, m, cfg.StagingDir(), func(done, total int64) {
-		ui.ShowForceProgress("Загрузка обновления " + m.Version + "…\n" + ui.FormatPercent(done, total))
-	})
-	if err != nil {
-		return fmt.Errorf("download: %w", err)
-	}
-	log.Printf("downloaded %s in %s (sha256 ok)", res.Path, res.Duration)
+	return withInstallLock(func() error {
+		res, err := client.DownloadToStaging(ctx, m, cfg.StagingDir(), func(done, total int64) {
+			ui.ShowForceProgress("Загрузка обновления " + m.Version + "…\n" + ui.FormatPercent(done, total))
+		})
+		if err != nil {
+			return fmt.Errorf("download: %w", err)
+		}
+		log.Printf("downloaded %s in %s (sha256 ok)", res.Path, res.Duration)
 
-	if err := killClientIfRunning(ctx, cfg); err != nil {
-		return err
-	}
-	if err := updater.ApplyVersion(res.Path, cfg.CurrentDir(), cfg.BackupsDir(), cfg.StagingDir(), cfg.CurrentVersion, m.Version, nil); err != nil {
-		return fmt.Errorf("apply: %w", err)
-	}
-	cfg.SetCurrentVersion(m.Version)
-	if err := cfg.Save(); err != nil {
-		log.Printf("save config after apply: %v", err)
-	}
-	copyUpdaterAfterApply(cfg)
-	_ = os.Remove(filepath.Join(cfg.StagingDir(), "update.json"))
-	log.Printf("applied update -> %s", m.Version)
-	return nil
+		if err := killClientIfRunning(ctx, cfg); err != nil {
+			return err
+		}
+		if err := updater.ApplyVersion(res.Path, cfg.CurrentDir(), cfg.StagingDir(), cfg.CurrentVersion, m.Version, nil); err != nil {
+			return fmt.Errorf("apply: %w", err)
+		}
+		cfg.SetCurrentVersion(m.Version)
+		if err := cfg.Save(); err != nil {
+			log.Printf("save config after apply: %v", err)
+		}
+		copyUpdaterAfterApply(cfg)
+		_ = os.Remove(filepath.Join(cfg.StagingDir(), "update.json"))
+		log.Printf("applied update -> %s", m.Version)
+		return nil
+	})
 }
 
 func handleSignals(cancel context.CancelFunc) {

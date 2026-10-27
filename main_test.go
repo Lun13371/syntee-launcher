@@ -22,6 +22,18 @@ func TestWaitChannelCancellation(t *testing.T) {
 	}
 }
 
+func TestUpdaterTempBootstrapHelpers(t *testing.T) {
+	if hasUpdaterTempArg([]string{"--other"}) {
+		t.Fatal("unexpected updater temp marker")
+	}
+	if !hasUpdaterTempArg([]string{"--other", updaterTempArg}) {
+		t.Fatal("updater temp marker not detected")
+	}
+	if relaunched, err := selfInstallIfNeeded(true); err != nil || relaunched {
+		t.Fatalf("temporary updater should skip self-install: relaunched=%v err=%v", relaunched, err)
+	}
+}
+
 func TestWaitChannelValueAndClosed(t *testing.T) {
 	ch := make(chan int, 1)
 	ch <- 42

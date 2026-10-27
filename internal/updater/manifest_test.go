@@ -55,6 +55,22 @@ func TestManifestValidation(t *testing.T) {
 	}
 }
 
+func TestUpgradeSameHostArtifactURL(t *testing.T) {
+	tests := []struct {
+		server, artifact, want string
+	}{
+		{"https://syntee.fun/api/public/updates", "http://syntee.fun/api/public/updates/download/stable/1.1.4", "https://syntee.fun/api/public/updates/download/stable/1.1.4"},
+		{"https://syntee.fun/api/public/updates", "http://cdn.syntee.fun/client.zip", "http://cdn.syntee.fun/client.zip"},
+		{"http://localhost:8080/api", "http://localhost:8080/file", "http://localhost:8080/file"},
+		{"https://syntee.fun/api", "https://syntee.fun/file", "https://syntee.fun/file"},
+	}
+	for _, tt := range tests {
+		if got := upgradeSameHostArtifactURL(tt.server, tt.artifact); got != tt.want {
+			t.Errorf("upgradeSameHostArtifactURL(%q, %q) = %q, want %q", tt.server, tt.artifact, got, tt.want)
+		}
+	}
+}
+
 func TestCheckValidatesAndEscapesQuery(t *testing.T) {
 	for _, mode := range []string{"good", "wrong channel", "bad hash", "trailing"} {
 		t.Run(mode, func(t *testing.T) {

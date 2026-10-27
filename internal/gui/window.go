@@ -26,6 +26,7 @@ const (
 	swpNoActivate   = 0x0010
 	swHide          = 0
 	swShow          = 5
+	swMinimize      = 6
 	wmNclButtonDown = 0xA1
 	htCaption       = 2
 	wmSize          = 0x0005

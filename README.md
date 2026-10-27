@@ -3,8 +3,7 @@
 Bootstrap updater for the SynteeHelper desktop client (Windows).
 
 `syntee-launcher.exe` installs, updates and repairs SynteeHelper. Desktop,
-Start Menu and autostart entries launch `current/Syntee Helper.exe` directly;
-the client can invoke `current/updater.exe` for its restart-to-update flow.
+Start Menu and autostart entries launch `current/Syntee Helper.exe` directly.
 The launcher is not a permanent supervisor of directly launched clients.
 
 Its lifecycle is:
@@ -14,10 +13,10 @@ Its lifecycle is:
 2. Check the gateway for a newer build. A failed check leaves the installed
    client available; known-bad releases must not be automatically reinstalled.
 3. Download with persistent partial-file resume, verify size and SHA256,
-   validate/extract into staging, back up the old client, then promote the new
-   directory. GUI updates are applied immediately after user acceptance;
-   forced updates do not require a decision. Headless mode applies forced
-   updates only.
+   validate/extract into staging, then replace the old client. The old build is
+   held only temporarily during the swap and is not retained as a version
+   backup. GUI updates are applied after user acceptance; forced updates do not
+   require a decision. Headless mode applies forced updates only.
 4. Launch the client independently of launcher lifetime. Startup monitoring
    can detect observed early failures, but complete crash-loop detection on
    direct shortcut launches requires client-side integration. Missing ready
@@ -28,18 +27,17 @@ Its lifecycle is:
 ```
 <install_dir>/
 ├── syntee-launcher.exe          ← this binary
-├── launcher.json                ← config: channel, current_version, bad_versions, ...
+├── launcher.json                ← config: channel, current_version, ...
 ├── syntee-launcher.log          ← diagnostic log (created on first run)
 ├── current/                     ← active client build
 │   ├── Syntee Helper.exe
 │   └── ...
-├── backups/                     ← previous versions (for rollback)
-│   └── 0.1.0_<unix_ts>/
-└── staging/                     ← scratch: download + unzip before atomic swap
-    ├── update.zip.part          ← persistent incomplete download
-    ├── update.zip.part.json     ← artifact identity and resume validators
-    ├── update.zip               ← fully verified archive only
-    └── apply.json               ← interrupted directory-swap recovery journal
+└── staging/                     ← scratch: download + swap workspace
+    ├── update.zip.part           ← persistent incomplete download
+    ├── update.zip.part.json      ← artifact identity and resume validators
+    ├── update.zip                ← fully verified archive only
+    ├── new/                      ← validated package awaiting promotion
+    └── apply.json                ← interrupted promotion recovery journal
 ```
 
 ## `launcher.json`
